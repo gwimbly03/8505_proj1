@@ -1,0 +1,8 @@
+[package]
+name = "source"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ctrlc = "3.5.1"
+time = { version = "0.3.46", features = ["formatting"] }
