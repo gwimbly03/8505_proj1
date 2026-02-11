@@ -6,6 +6,10 @@ use std::sync::{
 };
 use std::time::Duration;
 
+use rand::rngs::StdRng;
+use rand::{SeedableRng, Rng};
+
+
 use time::{OffsetDateTime, format_description};
 
 pub struct PortKnocker {
@@ -17,6 +21,13 @@ impl PortKnocker {
         Self {
             stop: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    fn generate_port(seed: u64) -> u16 {
+        let mut rng = StdRng::seed_from_u64(seed);
+
+        let port = (rng.next_u32() % (65535 - 1024 + 1)) + 1024;
+        port as u16
     }
 
     fn prompt(msg: &str) -> String {
@@ -32,15 +43,24 @@ impl PortKnocker {
         let now = OffsetDateTime::now_utc();
         let fmt = format_description::parse(
             "[year]-[month]-[day] [hour]:[minute]:[second]",
-        ).unwrap();
+        )
+        .unwrap();
+
         now.format(&fmt).unwrap()
     }
 
     pub fn start(&self) -> io::Result<()> {
-        let bind_ip = Self::prompt("Enter bind IP (e.g. 0.0.0.0): ");
-        let port: u16 = Self::prompt("Enter UDP port to listen on: ")
+        let mut bind_ip =
+            Self::prompt("Enter bind IP [default: 0.0.0.0]: ");
+        if bind_ip.is_empty() {
+            bind_ip = "0.0.0.0".to_string();
+        }
+
+        let seed: u64 = Self::prompt("Enter shared seed: ")
             .parse()
-            .expect("Invalid port");
+            .expect("Invalid seed");
+
+        let port = Self::generate_port(seed);
 
         let addr: SocketAddr = format!("{}:{}", bind_ip, port)
             .parse()
@@ -49,7 +69,10 @@ impl PortKnocker {
         let socket = UdpSocket::bind(addr)?;
         socket.set_read_timeout(Some(Duration::from_millis(200)))?;
 
-        println!("\nPort knocker listening on {}\n", addr);
+        println!(
+            "\nPort knocker listening on {} (seed-derived port {})\n",
+            addr, port
+        );
 
         let stop_signal = self.stop.clone();
         ctrlc::set_handler(move || {
@@ -70,7 +93,10 @@ impl PortKnocker {
                         n
                     );
                 }
-                Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                Err(e)
+                    if e.kind() == io::ErrorKind::TimedOut
+                        || e.kind() == io::ErrorKind::WouldBlock =>
+                {
                     continue;
                 }
                 Err(e) => {
