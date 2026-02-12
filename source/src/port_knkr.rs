@@ -1,114 +1,120 @@
-use std::io::{self, Write};
-use std::net::{SocketAddr, UdpSocket};
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
-use std::time::Duration;
+use std::io;
+use std::net::{IpAddr, Ipv4Addr};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use pnet::packet::tcp::{MutableTcpPacket, TcpFlags};
+use pnet::packet::ip::IpNextHeaderProtocols;
+use pnet::packet::ipv4::MutableIpv4Packet;
+use pnet::packet::MutablePacket;
+use pnet::transport::{transport_channel, TransportChannelType::Layer3};
 
 use rand::rngs::StdRng;
 use rand::{SeedableRng, Rng};
 
 
-use time::{OffsetDateTime, format_description};
+const KNOCK_COUNT: usize = 3;
 
-pub struct PortKnocker {
-    stop: Arc<AtomicBool>,
+/* =========================
+ * SEED + RNG
+ * ========================= */
+
+fn seed_from_ip(ip: &str) -> u64 {
+    ip.bytes().fold(0u64, |acc, b| acc.wrapping_mul(131).wrapping_add(b as u64))
 }
 
-impl PortKnocker {
-    pub fn new() -> Self {
-        Self {
-            stop: Arc::new(AtomicBool::new(false)),
-        }
+fn time_entropy() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64
+}
+
+fn generate_seed(ip: &str) -> u64 {
+    seed_from_ip(ip) ^ time_entropy()
+}
+
+fn generate_port(rng: &mut StdRng) -> u16 {
+    rng.gen_range(1024..=65535)
+}
+
+
+/* =========================
+ * KNOCK SEQUENCE
+ * ========================= */
+
+fn generate_knock_sequence(ip: &str) -> Vec<u16> {
+    let seed = generate_seed(ip);
+    let mut rng = StdRng::seed_from_u64(seed);
+
+    (0..KNOCK_COUNT)
+        .map(|_| generate_port(&mut rng))
+        .collect()
+}
+
+/* =========================
+ * RAW TCP SYN SENDER
+ * ========================= */
+
+fn send_syn(dest_ip: Ipv4Addr, dest_port: u16) -> io::Result<()> {
+    let (mut tx, _) = transport_channel(
+        1024,
+        Layer3(IpNextHeaderProtocols::Tcp),
+    )?;
+
+    let mut buffer = [0u8; 40];
+
+    let mut ip_packet = MutableIpv4Packet::new(&mut buffer).unwrap();
+    ip_packet.set_version(4);
+    ip_packet.set_header_length(5);
+    ip_packet.set_total_length(40);
+    ip_packet.set_ttl(64);
+    ip_packet.set_next_level_protocol(IpNextHeaderProtocols::Tcp);
+    ip_packet.set_source(Ipv4Addr::new(127, 0, 0, 1));
+    ip_packet.set_destination(dest_ip);
+
+    let mut tcp_packet =
+        MutableTcpPacket::new(ip_packet.payload_mut()).unwrap();
+
+    tcp_packet.set_source(40000 + (dest_port % 2000));
+    tcp_packet.set_destination(dest_port);
+    tcp_packet.set_sequence(0);
+    tcp_packet.set_flags(TcpFlags::SYN);
+    tcp_packet.set_window(64240);
+    tcp_packet.set_data_offset(5);
+
+    tx.send_to(ip_packet, IpAddr::V4(dest_ip))?;
+    Ok(())
+}
+
+/* =========================
+ * PUBLIC ENTRY POINT
+ * ========================= */
+
+pub fn port_knock() -> io::Result<()> {
+    print!("Enter victim IP (blank = 0.0.0.0): ");
+    io::Write::flush(&mut io::stdout())?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+
+    let ip_str = input.trim();
+    let ip = if ip_str.is_empty() {
+        Ipv4Addr::new(0, 0, 0, 0)
+    } else {
+        ip_str.parse().expect("Invalid IPv4 address")
+    };
+
+    let knocks = generate_knock_sequence(&ip.to_string());
+
+    println!("[*] Knock sequence: {:?}", knocks);
+
+    for port in knocks {
+        send_syn(ip, port)?;
+        println!("[+] Knocked port {}", port);
+        std::thread::sleep(std::time::Duration::from_millis(300));
     }
 
-    fn generate_port(seed: u64) -> u16 {
-        let mut rng = StdRng::seed_from_u64(seed);
-
-        let port = (rng.next_u32() % (65535 - 1024 + 1)) + 1024;
-        port as u16
-    }
-
-    fn prompt(msg: &str) -> String {
-        print!("{}", msg);
-        io::stdout().flush().unwrap();
-
-        let mut input = String::new();
-        io::stdin().read_line(&mut input).unwrap();
-        input.trim().to_string()
-    }
-
-    fn timestamp() -> String {
-        let now = OffsetDateTime::now_utc();
-        let fmt = format_description::parse(
-            "[year]-[month]-[day] [hour]:[minute]:[second]",
-        )
-        .unwrap();
-
-        now.format(&fmt).unwrap()
-    }
-
-    pub fn start(&self) -> io::Result<()> {
-        let mut bind_ip =
-            Self::prompt("Enter bind IP [default: 0.0.0.0]: ");
-        if bind_ip.is_empty() {
-            bind_ip = "0.0.0.0".to_string();
-        }
-
-        let seed: u64 = Self::prompt("Enter shared seed: ")
-            .parse()
-            .expect("Invalid seed");
-
-        let port = Self::generate_port(seed);
-
-        let addr: SocketAddr = format!("{}:{}", bind_ip, port)
-            .parse()
-            .expect("Invalid address");
-
-        let socket = UdpSocket::bind(addr)?;
-        socket.set_read_timeout(Some(Duration::from_millis(200)))?;
-
-        println!(
-            "\nPort knocker listening on {} (seed-derived port {})\n",
-            addr, port
-        );
-
-        let stop_signal = self.stop.clone();
-        ctrlc::set_handler(move || {
-            stop_signal.store(true, Ordering::SeqCst);
-        })
-        .expect("Failed to install Ctrl-C handler");
-
-        let mut buf = vec![0u8; 2048];
-
-        while !self.stop.load(Ordering::SeqCst) {
-            match socket.recv_from(&mut buf) {
-                Ok((n, src)) => {
-                    println!(
-                        "{} knock dst_port={} src={} bytes={}",
-                        Self::timestamp(),
-                        port,
-                        src,
-                        n
-                    );
-                }
-                Err(e)
-                    if e.kind() == io::ErrorKind::TimedOut
-                        || e.kind() == io::ErrorKind::WouldBlock =>
-                {
-                    continue;
-                }
-                Err(e) => {
-                    eprintln!("recv_from error: {}", e);
-                    break;
-                }
-            }
-        }
-
-        println!("Port knocker stopped.\n");
-        self.stop.store(false, Ordering::SeqCst);
-        Ok(())
-    }
+    println!("[✓] Port knock complete");
+    Ok(())
 }
 
