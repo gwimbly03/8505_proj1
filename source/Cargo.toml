@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+chrono = "0.4.43"
 ctrlc = "3.5.1"
+pcap = "2.4.0"
 pnet = "0.35.0"
 rand = "0.10.0"
 time = { version = "0.3.46", features = ["formatting"] }

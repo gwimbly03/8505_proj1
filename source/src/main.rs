@@ -1,6 +1,9 @@
 use std::io::{self, Write};
 use std::path::PathBuf;
 mod port_knkr;
+mod pcap_capture;
+
+use pcap_capture::PcapHandle;
 
 
 #[derive(Debug, PartialEq)]
@@ -169,6 +172,8 @@ fn prompt(msg: &str) -> String {
 }
 
 fn main() {
+    let _pcap = PcapHandle::start("lo");
+
     // Ctrl+C = immediate exit
     ctrlc::set_handler(|| {
         println!("\n[!] Ctrl+C received — exiting.");

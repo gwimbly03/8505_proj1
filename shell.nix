@@ -12,6 +12,8 @@ pkgs.mkShell {
     # If the dependencies need system libs, you usually need pkg-config + the lib
     pkgs.pkg-config
     pkgs.openssl
+    pkgs.libpcap
+    pkgs.gcc
   ];
 
   env = {
