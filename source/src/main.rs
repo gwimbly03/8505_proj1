@@ -196,7 +196,7 @@ impl Commander {
             for (i, byte) in data.iter().enumerate() {
                 transmitter.send_byte(*byte);
                 // Maintain throttle for reliability over raw sockets
-                thread::sleep(Duration::from_micros(500)); 
+                thread::sleep(Duration::from_micros(100)); 
 
                 if i % 1000 == 0 { // Increased interval for cleaner output
                     print!("\r[*] Progress: {}/{}", i, data.len());
