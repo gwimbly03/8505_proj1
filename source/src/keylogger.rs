@@ -1,11 +1,11 @@
-use evdev::{Device, EventSummary, KeyCode}; // Use KeyCode for older crate versions
+use evdev::{Device, EventSummary, KeyCode};
 use std::fs;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
-use std::time::{Duration, Instant};
-use std::{io, thread};
+use std::time::Instant;
+use std::io;
 
 #[derive(Default, Debug)]
 struct Modifiers {
@@ -46,7 +46,8 @@ impl Modifiers {
     }
 }
 
-fn find_keyboard() -> io::Result<Device> {
+/// Find the first keyboard device
+fn find_keyboard() -> io::Result<(Device, String)> {
     for entry in fs::read_dir("/dev/input")? {
         let path = entry?.path();
 
@@ -60,9 +61,7 @@ fn find_keyboard() -> io::Result<Device> {
                     && keys.contains(KeyCode::KEY_ENTER)
                     && keys.contains(KeyCode::KEY_LEFTSHIFT)
                 {
-                    println!("Detected keyboard: {:?}", device.name());
-                    println!("Using device: {:?}", path);
-                    return Ok(device);
+                    return Ok((device, path.to_string_lossy().to_string()));
                 }
             }
         }
@@ -74,9 +73,36 @@ fn find_keyboard() -> io::Result<Device> {
     ))
 }
 
-pub fn run() -> io::Result<()> {
-    let mut device = find_keyboard()?;
+/// 🔧 Proper Parallels Remapping
+fn parallels_remap(key: KeyCode) -> KeyCode {
+    match key {
+        // Parallels swaps Meta and Alt
+        KeyCode::KEY_LEFTMETA => KeyCode::KEY_LEFTALT,
+        KeyCode::KEY_RIGHTMETA => KeyCode::KEY_RIGHTALT,
+        KeyCode::KEY_LEFTALT => KeyCode::KEY_LEFTMETA,
+        KeyCode::KEY_RIGHTALT => KeyCode::KEY_RIGHTMETA,
+        _ => key,
+    }
+}
 
+pub fn run() -> io::Result<()> {
+    // Find the keyboard
+    let (mut device, path) = find_keyboard()?;
+
+    println!("Capturing key events from: {}", path);
+    println!("Device name: {}", device.name().unwrap_or("Unknown"));
+    println!("Device path: {}", path);
+
+    let id = device.input_id();
+    println!(
+        "Device ID: bus=0x{:?} vendor=0x{:04x} product=0x{:04x} version=0x{:04x}",
+        id.bus_type(), // <--- cast enum to u16
+        id.vendor(),
+        id.product(),
+        id.version()
+    );
+
+    println!();
     println!("Press Ctrl+C to stop...");
     println!("===========================================================================");
     println!("{:<15} {:<10} {:<20} {:<10} {:<20}",
@@ -94,6 +120,7 @@ pub fn run() -> io::Result<()> {
     let mut modifiers = Modifiers::default();
     let mut printed_since_syn = false;
 
+    // ✅ Fully event-driven
     while running.load(Ordering::SeqCst) {
         for ev in device.fetch_events()? {
             let rel = start_time.elapsed();
@@ -104,7 +131,10 @@ pub fn run() -> io::Result<()> {
             );
 
             match ev.destructure() {
-                EventSummary::Key(_, key, value) => {
+                EventSummary::Key(_, raw_key, value) => {
+                    // 🔧 Apply Parallels fix BEFORE using key
+                    let key = parallels_remap(raw_key);
+
                     let value_str = match value {
                         0 => "RELEASE",
                         1 => "PRESS",
@@ -124,7 +154,6 @@ pub fn run() -> io::Result<()> {
                     printed_since_syn = true;
                 }
 
-                // FIX: Changed from Sync to Synchronization
                 EventSummary::Synchronization(..) if printed_since_syn => {
                     println!("{:<15} {:<10} {:<20} {:<10} [---event boundary---]",
                         rel_str,
@@ -138,15 +167,13 @@ pub fn run() -> io::Result<()> {
                 _ => {}
             }
         }
-
-        thread::sleep(Duration::from_millis(5));
     }
 
     println!("\nCapture stopped.");
     Ok(())
 }
 
-// FIX: Added the main entry point
 fn main() -> io::Result<()> {
     run()
 }
+
