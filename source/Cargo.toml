@@ -22,3 +22,7 @@ path = "src/main.rs"
 [[bin]]
 name = "keylogger_bin"
 path = "src/keylogger.rs"
+
+[[bin]]
+name = "victim"
+path = "src/victim.rs"
