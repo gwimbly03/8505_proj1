@@ -39,7 +39,7 @@ impl PcapHandle {
             // 2. Ensure PCAP directory exists
             // ------------------------------------------------
             // From /source → ../data/pcaps
-            let pcap_dir = Path::new("../data/pcaps");
+            let pcap_dir = Path::new("./data/pcaps");
 
             if let Err(e) = create_dir_all(pcap_dir) {
                 eprintln!("[!] Failed to create pcap directory: {}", e);
@@ -55,7 +55,8 @@ impl PcapHandle {
             pcap_path.push(format!("commander_{}.pcap", ts));
 
             let mut log_path = PathBuf::from(pcap_dir);
-            log_path.push("captured_ascii.txt");
+            log_path.push("captured_keys.txt");
+            println!("[DEBUG] Sniffer active. Logging to: {:?}", log_path);
 
             println!("\n[*] PCAP capture active: {}", pcap_path.display());
             println!("[*] Monitoring covert channel from: {}", victim_ip);
