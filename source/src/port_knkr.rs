@@ -10,6 +10,7 @@ use pnet::packet::ip::IpNextHeaderProtocols;
 use pnet::packet::MutablePacket;
 use pnet::transport::{transport_channel, TransportChannelType::Layer3};
 
+// --- RNG Implementation (Unchanged) ---
 pub struct SimpleRng {
     state: u64,
 }
@@ -20,9 +21,7 @@ impl SimpleRng {
     }
 
     pub fn next_u32(&mut self) -> u32 {
-        self.state = self.state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1);
+        self.state = self.state.wrapping_mul(6364136223846793005).wrapping_add(1);
         (self.state >> 32) as u32
     }
 
@@ -31,9 +30,11 @@ impl SimpleRng {
     }
 }
 
+// --- Updated Session Struct ---
 pub struct KnockSession {
     pub stop_flag: Arc<AtomicBool>,
-    pub control_port: u16, // The port "allowed" to run services on
+    pub tx_port: u16, // Port we SEND to (Target's Listener)
+    pub rx_port: u16, // Port we LISTEN on (Target sends here)
 }
 
 impl KnockSession {
@@ -42,14 +43,13 @@ impl KnockSession {
     }
 }
 
-// Generates a seed based on IP and current time (synced by minute)
-// This allows both sides to agree on a seed if their clocks are roughly synced
 pub fn generate_seed(ip: &Ipv4Addr) -> u64 {
     let ip_u32: u32 = (*ip).into();
+    // Rounds time to the nearest minute to ensure both sides sync
     let time_step = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
-        .as_secs() / 60; // Changes every minute
+        .as_secs() / 60; 
     (ip_u32 as u64) ^ time_step
 }
 
@@ -57,23 +57,27 @@ pub fn port_knock(ip: Ipv4Addr) -> io::Result<KnockSession> {
     let seed = generate_seed(&ip);
     let mut rng = SimpleRng::new(seed);
     
-    // Generate the 3-port sequence
+    // 1. Generate the 3-port knock sequence
     let knocks = [rng.gen_port(), rng.gen_port(), rng.gen_port()];
-    // Generate the "allowed" port for the session
-    let control_port = rng.gen_port();
+    
+    // 2. Generate Command & Response ports deterministically
+    let tx_port = rng.gen_port(); // The port the Target will listen on
+    let rx_port = rng.gen_port(); // The port the Target will send back to
 
-    println!("[*] Secret knock sequence: {:?}", knocks);
-    println!("[*] Targeted control port: {}", control_port);
+    println!("[*] Secret Knock: {:?}", knocks);
+    println!("[*] Derived Channels -> TX: {} | RX: {}", tx_port, rx_port);
 
     let stop_flag = Arc::new(AtomicBool::new(false));
     let stop_clone = stop_flag.clone();
 
+    // Spawn background knocker
     thread::spawn(move || {
         while !stop_clone.load(Ordering::SeqCst) {
             for port in knocks.iter() {
                 if stop_clone.load(Ordering::SeqCst) { break; }
                 
                 let start = Instant::now();
+                // Knock duration logic
                 while start.elapsed() < Duration::from_millis(800) {
                     let _ = send_syn(ip, *port);
                     thread::sleep(Duration::from_millis(150));
@@ -83,11 +87,11 @@ pub fn port_knock(ip: Ipv4Addr) -> io::Result<KnockSession> {
         }
     });
 
-    Ok(KnockSession { stop_flag, control_port })
+    Ok(KnockSession { stop_flag, tx_port, rx_port })
 }
 
 fn send_syn(dest_ip: Ipv4Addr, dest_port: u16) -> io::Result<()> {
-    let (mut tx, _) = transport_channel(1024, Layer3(IpNextHeaderProtocols::Tcp))?;
+    let (mut tx, _) = transport_channel(4096, Layer3(IpNextHeaderProtocols::Tcp))?;
     let mut buffer = [0u8; 40];
     let mut ip = MutableIpv4Packet::new(&mut buffer).unwrap();
 
