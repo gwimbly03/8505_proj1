@@ -25,23 +25,24 @@ pub struct ChannelConfig {
 
 pub struct CovertChannel {
     pub config: Arc<ChannelConfig>,
-    pub tx: Box<dyn TransportSender>, // CHANGED: TransportSender
+    pub tx: TransportSender, // FIXED: Removed Box<dyn ...>
     pub running: Arc<AtomicBool>, 
 }
 
 impl CovertChannel {
     pub fn new(
-        _interface: &pnet::datalink::NetworkInterface, // Interface kept for compatibility
+        _interface: &pnet::datalink::NetworkInterface,
         target_ip: Ipv4Addr,
         local_ip: Ipv4Addr,
         send_port: u16,
         listen_port: u16,
     ) -> (Self, TransportReceiver) {
-        // CHANGED: Open a Layer 3 Transport Channel for TCP
         let protocol = Layer3(IpNextHeaderProtocols::Tcp);
+        
+        // Match on the result directly
         let (tx, rx) = match transport_channel(4096, protocol) {
             Ok((tx, rx)) => (tx, rx),
-            Err(e) => panic!("[!] Failed to open L3 channel: {}. Run with sudo/root.", e),
+            Err(e) => panic!("[!] Failed to open L3 channel: {}. Run with sudo.", e),
         };
 
         let config = Arc::new(ChannelConfig {
@@ -53,7 +54,7 @@ impl CovertChannel {
 
         (Self { 
             config, 
-            tx, 
+            tx, // No Box::new needed anymore
             running: Arc::new(AtomicBool::new(true)) 
         }, rx)
     }
