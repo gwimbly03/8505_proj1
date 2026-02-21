@@ -177,7 +177,7 @@ impl Victim {
                 let start = std::time::Instant::now();
                 while start.elapsed() < Duration::from_millis(500) {
                     if let Ok((packet, _)) = rx_iter.next() {
-                        if let Some(recv_id) = covert::parse_rst_ack_ip_id(packet.packet()) {
+                        if let Some(recv_id) = covert::parse_rst_ack_signature(packet.packet()) {
                             if recv_id == covert::signature_ip_id(ip_id, raw_word) {
                                 state.ack();
                                 break;

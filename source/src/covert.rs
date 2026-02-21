@@ -237,7 +237,7 @@ pub struct RstAckParams {
 
 /// Build IPv4+TCP RST/ACK. Receiver uses this to reply to a SYN.
 pub fn build_rst_ack_packet(params: &RstAckParams) -> Vec<u8> {
-    let mut buffer = [0u8; 40]; // 20 bytes IP + 20 bytes TCP
+    let mut buffer = [0u8; 40]; 
     
     // IPv4 Header
     {
@@ -246,12 +246,9 @@ pub fn build_rst_ack_packet(params: &RstAckParams) -> Vec<u8> {
         ip_pkt.set_header_length(5);
         ip_pkt.set_total_length(40);
         
-        // CRITICAL: Ensure this matches the signature
-        ip_pkt.set_identification(params.ip_id); 
-        
-        // Disable "Don't Fragment" - sometimes helps keep IP ID intact
+        // We set this to 0 and let the TCP window carry the weight
+        ip_pkt.set_identification(0); 
         ip_pkt.set_flags(0); 
-        
         ip_pkt.set_ttl(64);
         ip_pkt.set_next_level_protocol(IpNextHeaderProtocols::Tcp);
         ip_pkt.set_source(params.src_ip);
@@ -268,13 +265,14 @@ pub fn build_rst_ack_packet(params: &RstAckParams) -> Vec<u8> {
         tcp_pkt.set_destination(params.dst_port);
         tcp_pkt.set_acknowledgement(params.ack_number);
         tcp_pkt.set_flags(TcpFlags::RST | TcpFlags::ACK);
-        tcp_pkt.set_window(0); // Standard for RSTs
-        tcp_pkt.set_sequence(0);
         
+        // --- COVERT SIGNATURE MOVED HERE ---
+        tcp_pkt.set_window(params.ip_id); 
+        
+        tcp_pkt.set_sequence(0);
         let checksum = pnet::packet::tcp::ipv4_checksum(&tcp_pkt.to_immutable(), &params.src_ip, &params.dst_ip);
         tcp_pkt.set_checksum(checksum);
     }
-
     buffer.to_vec()
 }
 
@@ -314,16 +312,14 @@ pub fn parse_syn_from_ipv4_packet(ip_buf: &[u8]) -> Option<ParsedSyn> {
     })
 }
 
-/// Extract IP Identification from RST/ACK reply (sender verifies signature).
-pub fn parse_rst_ack_ip_id(packet: &[u8]) -> Option<u16> {
+pub fn parse_rst_ack_signature(packet: &[u8]) -> Option<u16> {
     let ipv4 = Ipv4Packet::new(packet)?;
     let tcp = TcpPacket::new(ipv4.payload())?;
 
-    // CRITICAL: Must check that RST is set. 
-    // The Kernel sends SYN+ACK. We send RST+ACK.
     let flags = tcp.get_flags();
     if (flags & TcpFlags::RST) != 0 && (flags & TcpFlags::ACK) != 0 {
-        return Some(ipv4.get_identification());
+        // Retrieve signature from the Window field instead of IP Identification
+        return Some(tcp.get_window());
     }
     None
 }

@@ -93,16 +93,14 @@ impl Commander {
                                      // println!("[DEBUG] Packet from Victim. Flags: {:b}", tcp.get_flags());
                                 }
 
-                                if let Some(recv_id) = covert::parse_rst_ack_ip_id(packet.packet()) {
+                                if let Some(recv_id) = covert::parse_rst_ack_signature(packet.packet()) {
                                     let expected_sig = covert::signature_ip_id(ip_id, raw_word);
                                     if recv_id == expected_sig {
                                         state.ack();
-                                        acked = true; // FIX: Use the 'acked' variable defined above
+                                        acked = true;
                                         break;
-                                    } else {
-                                        println!("[DEBUG] Sig mismatch: Got {}, Expected {}", recv_id, expected_sig);
                                     }
-                                }
+                                }                                
                             }
                         }
                     }
