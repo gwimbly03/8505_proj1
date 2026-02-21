@@ -236,53 +236,46 @@ pub struct RstAckParams {
 }
 
 /// Build IPv4+TCP RST/ACK. Receiver uses this to reply to a SYN.
-pub fn build_rst_ack_packet(params: &RstAckParams) -> [u8; PACKET_LEN] {
-    let mut buf = [0u8; PACKET_LEN];
-    let (ip_buf, tcp_buf) = buf.split_at_mut(IPV4_HEADER_LEN);
-
+pub fn build_rst_ack_packet(params: &RstAckParams) -> Vec<u8> {
+    let mut buffer = [0u8; 40]; // 20 bytes IP + 20 bytes TCP
+    
+    // IPv4 Header
     {
-        let mut tcp = MutableTcpPacket::new(tcp_buf).expect("tcp");
-        tcp.set_source(params.src_port);
-        tcp.set_destination(params.dst_port);
-        tcp.set_sequence(0);
-        tcp.set_acknowledgement(params.ack_number);
-        tcp.set_data_offset(5);
-        tcp.set_flags(TcpFlags::RST | TcpFlags::ACK);
-        tcp.set_window(0);
-        tcp.set_urgent_ptr(0);
-        tcp.set_checksum(0);
-    }
-    {
-        let mut ip = MutableIpv4Packet::new(ip_buf).expect("ip");
-        ip.set_version(4);
-        ip.set_header_length(5);
-        ip.set_dscp(0);
-        ip.set_ecn(0);
-        ip.set_total_length(PACKET_LEN as u16);
-        ip.set_identification(params.ip_id);
-        ip.set_flags(Ipv4Flags::DontFragment);
-        ip.set_fragment_offset(0);
-        ip.set_ttl(64);
-        ip.set_next_level_protocol(IpNextHeaderProtocols::Tcp);
-        ip.set_source(params.src_ip);
-        ip.set_destination(params.dst_ip);
-        ip.set_checksum(0);
+        let mut ip_pkt = MutableIpv4Packet::new(&mut buffer).unwrap();
+        ip_pkt.set_version(4);
+        ip_pkt.set_header_length(5);
+        ip_pkt.set_total_length(40);
+        
+        // CRITICAL: Ensure this matches the signature
+        ip_pkt.set_identification(params.ip_id); 
+        
+        // Disable "Don't Fragment" - sometimes helps keep IP ID intact
+        ip_pkt.set_flags(0); 
+        
+        ip_pkt.set_ttl(64);
+        ip_pkt.set_next_level_protocol(IpNextHeaderProtocols::Tcp);
+        ip_pkt.set_source(params.src_ip);
+        ip_pkt.set_destination(params.dst_ip);
+        
+        let checksum = pnet::packet::ipv4::checksum(&ip_pkt.to_immutable());
+        ip_pkt.set_checksum(checksum);
     }
 
-    let ip_cs = pnet::packet::ipv4::checksum(&Ipv4Packet::new(ip_buf).expect("ip view"));
-    MutableIpv4Packet::new(ip_buf).unwrap().set_checksum(ip_cs);
+    // TCP Header
+    {
+        let mut tcp_pkt = MutableTcpPacket::new(&mut buffer[20..]).unwrap();
+        tcp_pkt.set_source(params.src_port);
+        tcp_pkt.set_destination(params.dst_port);
+        tcp_pkt.set_acknowledgement(params.ack_number);
+        tcp_pkt.set_flags(TcpFlags::RST | TcpFlags::ACK);
+        tcp_pkt.set_window(0); // Standard for RSTs
+        tcp_pkt.set_sequence(0);
+        
+        let checksum = pnet::packet::tcp::ipv4_checksum(&tcp_pkt.to_immutable(), &params.src_ip, &params.dst_ip);
+        tcp_pkt.set_checksum(checksum);
+    }
 
-    let tcp_cs = pnet::packet::util::ipv4_checksum(
-        tcp_buf,
-        8,
-        &[],
-        &params.src_ip,
-        &params.dst_ip,
-        IpNextHeaderProtocols::Tcp,
-    );
-    MutableTcpPacket::new(tcp_buf).unwrap().set_checksum(tcp_cs);
-
-    buf
+    buffer.to_vec()
 }
 
 // -----------------------------------------------------------------------------
