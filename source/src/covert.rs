@@ -224,6 +224,58 @@ pub fn build_syn_packet(
     buf
 }
 
+pub fn build_syn_ack_packet(
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+) -> [u8; 40] {
+    let mut buf = [0u8; 40];
+    let (ip_buf, tcp_buf) = buf.split_at_mut(20);
+
+    {
+        let mut tcp = MutableTcpPacket::new(tcp_buf).unwrap();
+        tcp.set_source(src_port);
+        tcp.set_destination(dst_port);
+        tcp.set_sequence(seq);
+        tcp.set_acknowledgement(ack);
+        tcp.set_data_offset(5);
+        tcp.set_flags(TcpFlags::SYN | TcpFlags::ACK);
+        tcp.set_window(64240);
+        tcp.set_urgent_ptr(0);
+        tcp.set_checksum(0);
+    }
+
+    {
+        let mut ip = MutableIpv4Packet::new(ip_buf).unwrap();
+        ip.set_version(4);
+        ip.set_header_length(5);
+        ip.set_total_length(40);
+        ip.set_identification(0);
+        ip.set_flags(Ipv4Flags::DontFragment);
+        ip.set_fragment_offset(0);
+        ip.set_ttl(64);
+        ip.set_next_level_protocol(IpNextHeaderProtocols::Tcp);
+        ip.set_source(src_ip);
+        ip.set_destination(dst_ip);
+        ip.set_checksum(0);
+    }
+
+    let ip_cs = pnet::packet::ipv4::checksum(&Ipv4Packet::new(ip_buf).unwrap());
+    MutableIpv4Packet::new(ip_buf).unwrap().set_checksum(ip_cs);
+
+    let tcp_cs = pnet::packet::tcp::ipv4_checksum(
+        &TcpPacket::new(tcp_buf).unwrap(),
+        &src_ip,
+        &dst_ip,
+    );
+    MutableTcpPacket::new(tcp_buf).unwrap().set_checksum(tcp_cs);
+
+    buf
+}
+
 /// Parameters for RST/ACK reply (receiver side).
 #[derive(Clone)]
 pub struct RstAckParams {

