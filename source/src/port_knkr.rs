@@ -3,12 +3,10 @@ use std::net::{Ipv4Addr, IpAddr};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-
 use pnet::packet::tcp::{MutableTcpPacket, TcpFlags};
 use pnet::packet::ipv4::MutableIpv4Packet;
 use pnet::packet::ip::IpNextHeaderProtocols;
-// 1. IMPORT THE TRAIT: This fixes the "no method named `payload_mut` found" error
-use pnet::packet::MutablePacket; 
+use pnet::packet::MutablePacket;
 use pnet::transport::{transport_channel, TransportChannelType::Layer3, TransportSender};
 
 // --- RNG Implementation ---
@@ -83,31 +81,34 @@ pub fn port_knock(target_ip: Ipv4Addr) -> io::Result<KnockSession> {
                 }
                 thread::sleep(Duration::from_millis(200));
             }
+            break;
         }
     });
 
     Ok(KnockSession { stop_flag, tx_port, rx_port })
 }
 
-/// Minimal Layer 3 SYN packet to trigger the knock
 fn send_raw_syn(tx: &mut TransportSender, dest_ip: Ipv4Addr, dest_port: u16) -> io::Result<()> {
     let mut buffer = [0u8; 40];
     let mut ip = MutableIpv4Packet::new(&mut buffer).unwrap();
-
     ip.set_version(4);
     ip.set_header_length(5);
     ip.set_total_length(40);
     ip.set_ttl(64);
     ip.set_next_level_protocol(IpNextHeaderProtocols::Tcp);
     ip.set_destination(dest_ip);
+    // Source IP is usually filled by kernel or needs setting if not routing locally
+    // For raw sockets, setting source helps consistency
+    // ip.set_source(...); 
 
-    // 2. NOW WORKS: Because MutablePacket is in scope, ip.payload_mut() is accessible
     let mut tcp = MutableTcpPacket::new(ip.payload_mut()).unwrap();
     tcp.set_source(54321); 
     tcp.set_destination(dest_port);
     tcp.set_flags(TcpFlags::SYN);
     tcp.set_data_offset(5);
+    tcp.set_checksum(0); // Kernel often recalculates or ignores for raw
 
-    tx.send_to(ip, IpAddr::V4(dest_ip))?;
+    // Fix: Pass reference to packet, not value
+    tx.send_to(&ip, IpAddr::V4(dest_ip))?;
     Ok(())
 }

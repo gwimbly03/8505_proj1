@@ -1,10 +1,34 @@
-//! S10207 UDP storage covert channel: encode/decode, PRNG masking, integrity
-//! signature, and packet crafting for UDP datagrams.
+//! S10207 TCP storage covert channel: encode/decode, PRNG masking, integrity
+//! signature, and packet crafting for SYN and RST/ACK.
+//!
+//! # Covert Channel Field Usage
+//! ----------------------------
+//! ## SYN Packet (Sender → Receiver):
+//!   - IP Identification: PRNG seed / packet counter (covert data carrier)
+//!   - TCP Sequence: masked covert word (data + control code)
+//!   - TCP Window: fixed value (64240)
+//!   - TCP Urgent Pointer: 0 (explicitly zeroed per requirements)
+//!
+//! ## RST/ACK Packet (Receiver → Sender):
+//!   - IP Identification: 0 (unused)
+//!   - TCP Sequence: 0 (unused)
+//!   - TCP Window: signature for ACK validation (covert acknowledgment)
+//!   - TCP Urgent Pointer: 0 (explicitly zeroed per requirements)
+//!
+//! # Security Notes
+//! ----------------
+//! ⚠️  xorshift32 PRNG is NOT cryptographically secure.
+//!     Use only for obfuscation, not confidentiality.
+//!
+//! ⚠️  Raw socket access requires CAP_NET_RAW or root privileges.
+//!
+//! ⚠️  Kernel may drop RST packets without proper iptables NOTRACK rules.
+//!     See deployment documentation for system configuration.
 
 use std::net::Ipv4Addr;
 use pnet::packet::ip::IpNextHeaderProtocols;
 use pnet::packet::ipv4::{Ipv4Packet, MutableIpv4Packet, Ipv4Flags};
-use pnet::packet::udp::{MutableUdpPacket, UdpPacket};
+use pnet::packet::tcp::{MutableTcpPacket, TcpFlags, TcpPacket};
 use pnet::packet::Packet;
 
 // -----------------------------------------------------------------------------
@@ -62,8 +86,8 @@ pub enum ControlCode {
 const EOT_CHAR: u8 = 0x04;
 const PAD_CHAR: u8 = 0x00;
 
-/// IP Identification value the victim sends in ACK to abort the transaction.
-/// The sender must treat such a reply as rejected and stop immediately.
+/// IP Identification value the victim sends in RST/ACK to abort the transaction.
+/// The sender must treat such a reply as `CovertStreamError::Rejected` and stop immediately.
 pub const REJECT_IP_ID: u16 = 0xFFFF;
 
 impl ControlCode {
@@ -101,6 +125,10 @@ impl ControlCode {
 // -----------------------------------------------------------------------------
 
 /// Deterministic PRNG. Same on sender and receiver; zero seed avoided.
+/// 
+/// ⚠️  SECURITY WARNING: xorshift32 is NOT cryptographically secure.
+///     It provides obfuscation against casual inspection but should not
+///     be relied upon for confidentiality against determined adversaries.
 pub fn prng(mut x: u32) -> u32 {
     if x == 0 {
         x = 0xdead_beef;
@@ -142,19 +170,24 @@ pub fn decode_word(word: u32) -> Result<(ControlCode, [u8; 4]), CovertError> {
 // Masking and signature
 // -----------------------------------------------------------------------------
 
+/// Mask a raw covert word using IP ID as PRNG seed.
+/// Used by sender to obfuscate TCP sequence number.
 pub fn mask_word(raw_word: u32, ip_id: u16) -> u32 {
     raw_word ^ prng(ip_id as u32)
 }
 
-pub fn unmask_word(masked_word: u32, ip_id: u16) -> u32 {
-    masked_word ^ prng(ip_id as u32)
+/// Unmask a received TCP sequence number using IP ID as PRNG seed.
+/// Used by receiver to recover the original covert word.
+pub fn unmask_word(seq: u32, ip_id: u16) -> u32 {
+    seq ^ prng(ip_id as u32)
 }
 
-/// Full 32-bit signature; low 16 bits go in the ACK IP Identification.
+/// Full 32-bit signature; low 16 bits go in RST/ACK TCP Window field.
 pub fn compute_signature(ip_id: u16, raw_word: u32) -> u32 {
     prng((ip_id as u32).wrapping_add(raw_word))
 }
 
+/// Extract 16-bit signature for RST/ACK TCP Window field.
 pub fn signature_ip_id(ip_id: u16, raw_word: u32) -> u16 {
     (compute_signature(ip_id, raw_word) & 0xffff) as u16
 }
@@ -164,89 +197,167 @@ pub fn signature_ip_id(ip_id: u16, raw_word: u32) -> u16 {
 // -----------------------------------------------------------------------------
 
 const IPV4_HEADER_LEN: usize = 20;
-const UDP_HEADER_LEN: usize = 8;
-const PACKET_LEN: usize = IPV4_HEADER_LEN + UDP_HEADER_LEN;
-const ACK_PACKET_LEN: usize = IPV4_HEADER_LEN + UDP_HEADER_LEN; // Empty payload for ACK
+const TCP_HEADER_LEN: usize = 20;
+const PACKET_LEN: usize = IPV4_HEADER_LEN + TCP_HEADER_LEN;
 
-/// Build IPv4+UDP Sender Packet. Caller sends the buffer via raw socket.
-pub fn build_udp_sender_packet(
+/// Build IPv4+TCP SYN packet with covert data embedded.
+/// 
+/// # Important
+/// Must be sent via Layer 3 socket (Protocol::Ipv4), NOT Layer 4 (Protocol::Tcp).
+/// Layer 4 sockets will overwrite the IP header and break the covert channel.
+/// 
+/// # Kernel Compatibility
+/// To prevent kernel from dropping RST packets:
+/// - Use iptables raw table: `iptables -t raw -A OUTPUT -j NOTRACK`
+/// - Disable rp_filter: `sysctl -w net.ipv4.conf.all.rp_filter=0`
+/// - Disable checksum offloading: `ethtool -K eth0 tx off`
+pub fn build_syn_packet(
     src_ip: Ipv4Addr,
     dst_ip: Ipv4Addr,
     src_port: u16,
     dst_port: u16,
-    ip_id: u16,          // PRNG seed
-    masked_word: u32,
+    ip_id: u16,
+    masked_seq: u32,
 ) -> [u8; PACKET_LEN] {
     let mut buf = [0u8; PACKET_LEN];
-    let (ip_buf, udp_buf) = buf.split_at_mut(IPV4_HEADER_LEN);
+    let (ip_buf, tcp_buf) = buf.split_at_mut(IPV4_HEADER_LEN);
 
-    let upper = (masked_word >> 16) as u16;
-    let lower = (masked_word & 0xffff) as u16;
-
-    // ---------------- UDP HEADER ----------------
+    // Craft TCP header first (needed for checksum calculation)
     {
-        let mut udp = MutableUdpPacket::new(udp_buf).expect("udp");
-        udp.set_source(src_port);
-        udp.set_destination(dst_port);
-
-        // Store upper 16 bits of masked word here
-        udp.set_length(upper);
-
-        // Store lower 16 bits here
-        udp.set_checksum(lower);
+        let mut tcp = MutableTcpPacket::new(tcp_buf).expect("tcp buffer too small");
+        tcp.set_source(src_port);
+        tcp.set_destination(dst_port);
+        tcp.set_sequence(masked_seq);
+        tcp.set_acknowledgement(0);
+        tcp.set_data_offset(5); // 20 bytes, no options
+        tcp.set_flags(TcpFlags::SYN);
+        tcp.set_window(64240); // Fixed window size
+        tcp.set_urgent_ptr(0); // Explicitly zeroed per requirements
+        tcp.set_checksum(0);   // Temporary, will be calculated below
     }
 
-    // ---------------- IPv4 HEADER ----------------
+    // Craft IPv4 header
     {
-        let mut ip = MutableIpv4Packet::new(ip_buf).expect("ip");
+        let mut ip = MutableIpv4Packet::new(ip_buf).expect("ip buffer too small");
         ip.set_version(4);
-        ip.set_header_length(5);
+        ip.set_header_length(5); // 20 bytes
+        ip.set_dscp(0);
+        ip.set_ecn(0);
         ip.set_total_length(PACKET_LEN as u16);
-
-        // KEEP original ip_id as PRNG seed
-        ip.set_identification(ip_id);
-
+        ip.set_identification(ip_id); // Covert channel carrier
         ip.set_flags(Ipv4Flags::DontFragment);
         ip.set_fragment_offset(0);
         ip.set_ttl(64);
-        ip.set_next_level_protocol(IpNextHeaderProtocols::Udp);
+        ip.set_next_level_protocol(IpNextHeaderProtocols::Tcp);
         ip.set_source(src_ip);
         ip.set_destination(dst_ip);
-
-        let checksum = pnet::packet::ipv4::checksum(&ip.to_immutable());
-        ip.set_checksum(checksum);
+        ip.set_checksum(0); // Temporary, will be calculated below
     }
+
+    // Calculate and set IP checksum
+    let ip_cs = pnet::packet::ipv4::checksum(&Ipv4Packet::new(ip_buf).expect("ip view"));
+    MutableIpv4Packet::new(ip_buf).unwrap().set_checksum(ip_cs);
+
+    // Calculate and set TCP checksum (includes pseudo-header)
+    let tcp_cs = pnet::packet::tcp::ipv4_checksum(
+        &TcpPacket::new(tcp_buf).unwrap(),
+        &src_ip,
+        &dst_ip,
+    );
+    MutableTcpPacket::new(tcp_buf).unwrap().set_checksum(tcp_cs);
 
     buf
 }
 
-/// Parameters for UDP Ack reply (receiver side).
+/// Build IPv4+TCP SYN-ACK packet (for handshake simulation if needed).
+/// Note: This is not part of the core covert channel protocol.
+pub fn build_syn_ack_packet(
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+) -> [u8; 40] {
+    let mut buf = [0u8; 40];
+    let (ip_buf, tcp_buf) = buf.split_at_mut(20);
+
+    {
+        let mut tcp = MutableTcpPacket::new(tcp_buf).unwrap();
+        tcp.set_source(src_port);
+        tcp.set_destination(dst_port);
+        tcp.set_sequence(seq);
+        tcp.set_acknowledgement(ack);
+        tcp.set_data_offset(5);
+        tcp.set_flags(TcpFlags::SYN | TcpFlags::ACK);
+        tcp.set_window(64240);
+        tcp.set_urgent_ptr(0); // Explicitly zeroed per requirements
+        tcp.set_checksum(0);
+    }
+
+    {
+        let mut ip = MutableIpv4Packet::new(ip_buf).unwrap();
+        ip.set_version(4);
+        ip.set_header_length(5);
+        ip.set_total_length(40);
+        ip.set_identification(0);
+        ip.set_flags(Ipv4Flags::DontFragment);
+        ip.set_fragment_offset(0);
+        ip.set_ttl(64);
+        ip.set_next_level_protocol(IpNextHeaderProtocols::Tcp);
+        ip.set_source(src_ip);
+        ip.set_destination(dst_ip);
+        ip.set_checksum(0);
+    }
+
+    let ip_cs = pnet::packet::ipv4::checksum(&Ipv4Packet::new(ip_buf).unwrap());
+    MutableIpv4Packet::new(ip_buf).unwrap().set_checksum(ip_cs);
+
+    let tcp_cs = pnet::packet::tcp::ipv4_checksum(
+        &TcpPacket::new(tcp_buf).unwrap(),
+        &src_ip,
+        &dst_ip,
+    );
+    MutableTcpPacket::new(tcp_buf).unwrap().set_checksum(tcp_cs);
+
+    buf
+}
+
+/// Parameters for RST/ACK reply (receiver side).
 #[derive(Clone)]
-pub struct UdpAckParams {
+pub struct RstAckParams {
     pub src_ip: Ipv4Addr,
     pub dst_ip: Ipv4Addr,
     pub src_port: u16,
     pub dst_port: u16,
-    pub ip_id_signature: u16,
+    pub ack_number: u32,
+    /// Signature value to embed in TCP Window field for acknowledgment
+    pub ip_id: u16,
 }
 
-/// Build IPv4+UDP Ack Packet. Receiver uses this to reply to a sender.
-pub fn build_udp_ack_packet(params: &UdpAckParams) -> Vec<u8> {
-    let mut buffer = [0u8; ACK_PACKET_LEN]; 
+/// Build IPv4+TCP RST/ACK packet for receiver acknowledgment.
+/// 
+/// # Covert Channel Usage
+/// The acknowledgment signature is embedded in the TCP Window field,
+/// NOT in the IP Identification field (which is set to 0).
+/// 
+/// # Kernel Compatibility
+/// RST packets without established connections will be dropped by default.
+/// Use iptables NOTRACK rules to bypass connection tracking.
+pub fn build_rst_ack_packet(params: &RstAckParams) -> Vec<u8> {
+    let mut buffer = [0u8; 40]; 
     
     // IPv4 Header
     {
         let mut ip_pkt = MutableIpv4Packet::new(&mut buffer).unwrap();
         ip_pkt.set_version(4);
         ip_pkt.set_header_length(5);
-        ip_pkt.set_total_length(ACK_PACKET_LEN as u16);
-        
-        // Return the signature inside the IP ID field
-        ip_pkt.set_identification(params.ip_id_signature); 
-        
-        ip_pkt.set_flags(Ipv4Flags::DontFragment); 
+        ip_pkt.set_total_length(40);
+        ip_pkt.set_identification(0); // Unused in RST/ACK
+        ip_pkt.set_flags(Ipv4Flags::DontFragment);
+        ip_pkt.set_fragment_offset(0);
         ip_pkt.set_ttl(64);
-        ip_pkt.set_next_level_protocol(IpNextHeaderProtocols::Udp);
+        ip_pkt.set_next_level_protocol(IpNextHeaderProtocols::Tcp);
         ip_pkt.set_source(params.src_ip);
         ip_pkt.set_destination(params.dst_ip);
         
@@ -254,64 +365,75 @@ pub fn build_udp_ack_packet(params: &UdpAckParams) -> Vec<u8> {
         ip_pkt.set_checksum(checksum);
     }
 
-    // UDP Header
+    // TCP Header
     {
-        let mut udp_pkt = MutableUdpPacket::new(&mut buffer[20..]).unwrap();
-        udp_pkt.set_source(params.src_port);
-        udp_pkt.set_destination(params.dst_port);
-        udp_pkt.set_length(UDP_HEADER_LEN as u16); // No payload needed for ACK
+        let mut tcp_pkt = MutableTcpPacket::new(&mut buffer[20..]).unwrap();
+        tcp_pkt.set_source(params.src_port);
+        tcp_pkt.set_destination(params.dst_port);
+        tcp_pkt.set_acknowledgement(params.ack_number);
+        tcp_pkt.set_flags(TcpFlags::RST | TcpFlags::ACK);
         
-        let checksum = pnet::packet::udp::ipv4_checksum(&udp_pkt.to_immutable(), &params.src_ip, &params.dst_ip);
-        udp_pkt.set_checksum(checksum);
+        // --- COVERT SIGNATURE IN TCP WINDOW FIELD ---
+        tcp_pkt.set_window(params.ip_id); 
+        
+        tcp_pkt.set_sequence(0);
+        tcp_pkt.set_urgent_ptr(0); // Explicitly zeroed per requirements
+        
+        let checksum = pnet::packet::tcp::ipv4_checksum(
+            &tcp_pkt.to_immutable(), 
+            &params.src_ip, 
+            &params.dst_ip
+        );
+        tcp_pkt.set_checksum(checksum);
     }
     buffer.to_vec()
 }
 
 // -----------------------------------------------------------------------------
-// Parse Packets
+// Parse SYN and RST/ACK
 // -----------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
-pub struct ParsedUdpData {
+pub struct ParsedSyn {
     pub src_ip: Ipv4Addr,
     pub dst_ip: Ipv4Addr,
     pub src_port: u16,
     pub dst_port: u16,
     pub ip_id: u16,
-    pub masked_word: u32,
+    pub seq: u32,
 }
 
-/// Parse IPv4 packet as UDP Covert Sender Data. Returns None if invalid.
-pub fn parse_udp_data_from_ipv4(ip_buf: &[u8]) -> Option<ParsedUdpData> {
+/// Parse IPv4 packet as TCP SYN. Returns None if not SYN or not TCP.
+pub fn parse_syn_from_ipv4_packet(ip_buf: &[u8]) -> Option<ParsedSyn> {
     let ip = Ipv4Packet::new(ip_buf)?;
-    if ip.get_next_level_protocol() != IpNextHeaderProtocols::Udp {
+    if ip.get_next_level_protocol() != IpNextHeaderProtocols::Tcp {
         return None;
     }
-
-    let udp = UdpPacket::new(ip.payload())?;
-
-    let ip_id = ip.get_identification(); // PRNG seed
-
-    let upper = udp.get_length();
-    let lower = udp.get_checksum();
-
-    let masked_word = ((upper as u32) << 16) | lower as u32;
-
-    Some(ParsedUdpData {
+    let tcp = TcpPacket::new(ip.payload())?;
+    let syn = tcp.get_flags() & TcpFlags::SYN != 0;
+    let ack = tcp.get_flags() & TcpFlags::ACK != 0;
+    if !syn || ack {
+        return None;
+    }
+    Some(ParsedSyn {
         src_ip: ip.get_source(),
         dst_ip: ip.get_destination(),
-        src_port: udp.get_source(),
-        dst_port: udp.get_destination(),
-        ip_id,
-        masked_word,
+        src_port: tcp.get_source(),
+        dst_port: tcp.get_destination(),
+        ip_id: ip.get_identification(),
+        seq: tcp.get_sequence(),
     })
 }
 
-/// Retrieve the 16-bit signature from the IP ID field of the ACK packet.
-pub fn parse_udp_ack_signature(packet: &[u8]) -> Option<u16> {
+/// Extract acknowledgment signature from RST/ACK packet TCP Window field.
+pub fn parse_rst_ack_signature(packet: &[u8]) -> Option<u16> {
     let ipv4 = Ipv4Packet::new(packet)?;
-    if ipv4.get_next_level_protocol() == IpNextHeaderProtocols::Udp {
-        return Some(ipv4.get_identification());
+    let tcp = TcpPacket::new(ipv4.payload())?;
+
+    let flags = tcp.get_flags();
+    if (flags & TcpFlags::RST) != 0 && (flags & TcpFlags::ACK) != 0 {
+        // Retrieve signature from the TCP Window field
+        return Some(tcp.get_window());
     }
     None
 }
@@ -413,18 +535,18 @@ impl SenderState {
         self.index < self.chunks.len()
     }
 
-    /// Return (ip_id, raw_word, masked_word) for current chunk; increments next_ip_id only.
-    /// Call again for retransmit (new ip_id, same logical chunk). Call ack() after ACK verified.
+    /// Return (ip_id, raw_word, masked_seq) for current chunk; increments next_ip_id only.
+    /// Call again for retransmit (new ip_id, same logical chunk). Call ack() after RST/ACK verified.
     pub fn chunk_to_send(&mut self) -> Option<(u16, u32, u32)> {
         let (control, chars) = self.chunks.get(self.index)?.clone();
         let ip_id = self.next_ip_id;
         self.next_ip_id = self.next_ip_id.wrapping_add(1);
         let raw_word = encode_chunk(chars, control);
-        let masked_word = mask_word(raw_word, ip_id);
-        Some((ip_id, raw_word, masked_word))
+        let masked_seq = mask_word(raw_word, ip_id);
+        Some((ip_id, raw_word, masked_seq))
     }
 
-    /// Call after UDP ACK signature verified for current chunk.
+    /// Call after RST/ACK signature verified for current chunk.
     pub fn ack(&mut self) {
         self.index += 1;
     }
@@ -491,7 +613,7 @@ impl ReceiverState {
         }
     }
 
-    /// Apply one chunk; returns action and 16-bit signature for UDP ACK IP ID.
+    /// Apply one chunk; returns action and 16-bit signature for RST/ACK TCP Window.
     pub fn apply_chunk(&mut self, ip_id: u16, raw_word: u32) -> Result<(ReceiverAction, u16), CovertError> {
         let (control, chars) = decode_word(raw_word)?;
         let action = decode_and_apply(&mut self.buffer, control, chars)?;
