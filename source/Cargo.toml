@@ -13,6 +13,7 @@ notify = "8.2.0"
 pcap = "2.4.0"
 pnet = "0.35.0"
 pnet_datalink = "0.35.0"
+prctl = "1.0.0"
 rand = "0.10.0"
 signal-hook = "0.4.3"
 time = { version = "0.3.46", features = ["formatting"] }

