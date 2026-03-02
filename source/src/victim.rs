@@ -588,15 +588,6 @@ impl Victim {
         Ok(())
     }
 }
-
-fn main() -> io::Result<()> {
-    let mut victim = Victim::new()?;
-
-    match victim.run() {
-        Ok(_) => Ok(()),
-        Err(e) => {
-            eprintln!("[!] Error: {}", e);
-            Err(e)
-        }
-    }
+fn main() {
+    let _ = Victim::new().and_then(|mut victim| victim.run());
 }
