@@ -367,6 +367,7 @@ impl Commander {
                                             self.file_watch_buffer.remove(&ip);
                                         }
                                     }
+
                                     FILE_WATCH_DELETE => {
                                         println!("[!] File deleted remotely");
                                         if let Some(local_path) = &self.file_watch_local_path {
