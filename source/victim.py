@@ -101,6 +101,8 @@ class Victim:
             # Check if enough time has passed to reset (30 second window)
             current_time = time.time()
             if current_time - self.last_knock_time > 30:
+                if self.knock_state > 0:
+                    print(f"[!] Timeout - resetting knock sequence")
                 self.knock_state = 0
                 self.expected_knocks = []
             
@@ -112,6 +114,7 @@ class Victim:
                 if res:
                     self.expected_knocks, self.temp_tx, self.temp_rx = res
                     print(f"[*] Generated expected sequence for {victim_ip}")
+                    print(f"[*] Expected ports: {self.expected_knocks}")
                 else:
                     return False
 
@@ -130,16 +133,20 @@ class Victim:
                     print(f"[+] Covert Ports: TX={self.tx_port}, RX={self.rx_port}")
                     return True  # Stop sniffing
             else:
-                # Reset if wrong port received
-                if self.knock_state > 0:
+                # Only reset if it's not a duplicate of current or previous knock
+                if self.knock_state > 0 and dport not in self.expected_knocks[:self.knock_state]:
+                    print(f"[!] Wrong port {dport}, expected {self.expected_knocks[self.knock_state]}. Resetting.")
                     self.knock_state = 0
-                    print("[!] Knock sequence failed, resetting.")
             
             return False
 
-        sniff(filter="tcp and tcp[tcpflags] & tcp-syn != 0", 
-              prn=process_knock, 
-              stop_filter=lambda x: self.is_connected)
+        # Use a more specific filter - only SYN packets
+        sniff(
+            filter="tcp[tcpflags] & tcp-syn != 0", 
+            prn=process_knock, 
+            stop_filter=lambda x: self.is_connected,
+            store=0  # Don't store packets in memory
+        )
 
     def send_covert_response(self, message):
         """
