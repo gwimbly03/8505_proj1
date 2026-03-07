@@ -67,7 +67,7 @@ class PortKnocker:
             send(pkt, verbose=False)
             
             # Delay between moving to the next port in the sequence
-            time.sleep(0.3)
+            time.sleep(0.5)
             
         print("[+] Knock sequence complete. Session ready.")
         return self.tx_port, self.rx_port

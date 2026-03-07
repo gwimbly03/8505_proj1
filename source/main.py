@@ -94,6 +94,7 @@ class Commander:
             print("[!] Knock failed. Check if victim is running.")
 
     def display_output(self, timeout=3):
+        
         start_time = time.time()
         last_buffer_len = 0
         

