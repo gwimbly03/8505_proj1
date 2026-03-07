@@ -8,7 +8,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use pnet::packet::ip::IpNextHeaderProtocols;
 use pnet::transport::{transport_channel, TransportChannelType::Layer3};
 use pnet_datalink as datalink;
-
+use hickory_server::ServerFuture;
+use hickory_server::authority::{Catalog, ZoneType, Authority};
+use hickory_server::authority::in_memory::InMemoryAuthority;
+use hickory_proto::rr::Name;
+use std::net::{IpAddr, Ipv4Addr};
+use tokio::runtime::Runtime;
+mod dns_transport;
 mod port_knkr;
 mod packet;
 
