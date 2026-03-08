@@ -112,7 +112,6 @@ class Commander:
                     char = chr(char_code)
                     
                     with self.output_lock:
-                        # ALWAYS add to watch buffer first (to detect markers)
                         self.watch_buffer += char
                         
                         # Check for watch file START marker
@@ -347,6 +346,7 @@ class Commander:
         os.makedirs("./watched", exist_ok=True)
         
         print(f"[*] Watching {path}")
+        print(f"[*] Modify the file to trigger transfer")
         self.send_covert_command("WATCH", path)
         time.sleep(0.5)
 

