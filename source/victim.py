@@ -455,6 +455,7 @@ class Victim:
             import traceback
             traceback.print_exc()
             self._start_watcher_polling(path)
+
     def _start_watcher_polling(self, path):
         """Fallback polling-based watcher if pyinotify unavailable."""
         def watch_loop():
