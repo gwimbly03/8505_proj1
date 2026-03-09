@@ -188,12 +188,21 @@ class Commander:
                 print(f"\n[!] Listener error: {e}")
 
     def _snapshot_path(self, relative: str) -> Path:
-        """Build a timestamped snapshot filename."""
+        """Build a timestamped snapshot filename inside ./watched."""
+
         rel = Path(relative)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
         name = f"{rel.stem}_{ts}{rel.suffix}"
+
         watch_root = Path("./watched")
-        return watch_root / rel.parent / name
+
+        # remove leading slash so it stays inside watched
+        rel_parent = rel.parent
+        if str(rel_parent) == ".":
+            return watch_root / name
+
+        return watch_root / rel_parent / name
 
     def _save_watched_file(self):
         """Save received watched file to ./watched/ folder with timestamp."""
