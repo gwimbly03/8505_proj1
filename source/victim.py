@@ -147,7 +147,7 @@ class Victim:
                     flags="A"
                 )
                 send(pkt, verbose=False)
-                time.sleep(0.01)
+                time.sleep(0.003)
             except Exception:
                 break
 
